@@ -1,0 +1,39 @@
+{
+  "vektor-safety-gate": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command|write_file|edit_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vektor hook pre-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "vektor-post-tool": {
+    "PostToolUse": [
+      {
+        "matcher": "edit_file|write_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "vektor hook post-tool-use",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  },
+  "vektor-stop-gate": {
+    "Stop": [
+      {
+        "type": "command",
+        "command": "vektor hook stop",
+        "timeout": 25
+      }
+    ]
+  }
+}

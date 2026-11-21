@@ -1,0 +1,11 @@
+{
+  "name": "vektor",
+  "displayName": "Vektor Dev Team",
+  "version": "0.1.0",
+  "description": "High-speed Rust MCP engine, deterministic lifecycle hooks, and a 5-expert Rust/GitHub/Security dev team integrated with Engram memory for Antigravity.",
+  "suggestedPrompts": [
+    "Audit this Rust workspace with rust-expert, crates-specialist, and security-auditor",
+    "Review and harden our GitHub Actions workflows for Rust CI/CD",
+    "Plan a new Rust feature using the Vektor dev team and persist decisions in Engram"
+  ]
+}
