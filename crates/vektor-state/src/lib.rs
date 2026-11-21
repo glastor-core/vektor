@@ -1,16 +1,21 @@
 //! `SQLite` WAL shared state for Vektor: Swarm Task Blackboard, File Locks,
 //! incremental Rust AST symbol index, and dirty-file tracking for `Stop` gates.
 
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use std::collections::BTreeSet;
+use std::fmt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use vektor_analyzers::rust_ast::RustSymbol;
 
 const DEFAULT_LOCK_TTL_SECS: i64 = 1800; // 30 minutes
+const MIN_LOCK_TTL_SECS: i64 = 10;
+const MAX_LOCK_TTL_SECS: i64 = 86_400; // 24 hours
 
 /// Shared task record on the Swarm Blackboard.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,9 +46,21 @@ pub struct StateStore {
     conn: Connection,
 }
 
+impl fmt::Debug for StateStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StateStore").finish_non_exhaustive()
+    }
+}
+
 impl StateStore {
     /// Open or initialize `<workspace>/.vektor/state.db` in WAL mode.
     pub fn open_workspace(workspace_root: &Path) -> Result<Self> {
+        if !workspace_root.is_dir() {
+            anyhow::bail!(
+                "Workspace root does not exist or is not a directory: {}",
+                workspace_root.display()
+            );
+        }
         let dir = workspace_root.join(".vektor");
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("Failed to create {}", dir.display()))?;
@@ -209,7 +226,7 @@ impl StateStore {
             params![now],
         )?;
 
-        // Check existing active lock.
+        // Check existing active lock (propagate real SQLite errors instead of masking with `.ok()`).
         let existing: Option<FileLock> = {
             let mut stmt = tx.prepare(
                 "SELECT file_path, owner_agent, reason, acquired_at, expires_at
@@ -224,7 +241,7 @@ impl StateStore {
                     expires_at: row.get(4)?,
                 })
             })
-            .ok()
+            .optional()?
         };
 
         if let Some(lock) = existing {
@@ -234,7 +251,10 @@ impl StateStore {
             }
         }
 
-        let expires_at = now + ttl_secs.unwrap_or(DEFAULT_LOCK_TTL_SECS).max(10);
+        let ttl = ttl_secs
+            .unwrap_or(DEFAULT_LOCK_TTL_SECS)
+            .clamp(MIN_LOCK_TTL_SECS, MAX_LOCK_TTL_SECS);
+        let expires_at = now.saturating_add(ttl);
         tx.execute(
             "INSERT INTO file_locks (file_path, owner_agent, reason, acquired_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -310,7 +330,9 @@ impl StateStore {
         symbols: &[RustSymbol],
     ) -> Result<()> {
         let normalized = normalize_rel(file_path);
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "DELETE FROM ast_symbols WHERE file_path = ?1",
             params![&normalized],
@@ -343,7 +365,7 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn indexed_mtime(&self, file_path: &str) -> Option<i64> {
+    pub fn indexed_mtime(&self, file_path: &str) -> Result<Option<i64>> {
         let normalized = normalize_rel(file_path);
         self.conn
             .query_row(
@@ -351,11 +373,14 @@ impl StateStore {
                 params![normalized],
                 |row| row.get(0),
             )
-            .ok()
+            .optional()
+            .context("Failed to query ast_file_meta mtime")
     }
 
     /// Remove cached AST symbols and metadata for files that no longer exist on disk.
     pub fn prune_missing_ast_files(&mut self, existing_files: &BTreeSet<String>) -> Result<usize> {
+        let normalized_existing: BTreeSet<String> =
+            existing_files.iter().map(|p| normalize_rel(p)).collect();
         let indexed: Vec<String> = {
             let mut stmt = self.conn.prepare("SELECT file_path FROM ast_file_meta")?;
             let rows = stmt.query_map([], |row| row.get(0))?;
@@ -368,13 +393,15 @@ impl StateStore {
 
         let stale: Vec<String> = indexed
             .into_iter()
-            .filter(|f| !existing_files.contains(f))
+            .filter(|f| !normalized_existing.contains(f))
             .collect();
         if stale.is_empty() {
             return Ok(0);
         }
 
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for path in &stale {
             tx.execute(
                 "DELETE FROM ast_symbols WHERE file_path = ?1",
@@ -396,33 +423,36 @@ impl StateStore {
         file_filter: Option<&str>,
         limit: usize,
     ) -> Result<Vec<RustSymbol>> {
-        let name_pat = name_query.map_or_else(|| "%".to_string(), |q| format!("%{q}%"));
-        let kind_pat = kind_filter.unwrap_or("%");
-        let file_pat =
-            file_filter.map_or_else(|| "%".to_string(), |f| format!("%{}%", normalize_rel(f)));
+        let name_pat = name_query.map(|q| format!("%{}%", escape_like(q)));
+        let file_pat = file_filter.map(|f| format!("%{}%", escape_like(&normalize_rel(f))));
 
         let mut stmt = self.conn.prepare(
             "SELECT file_path, name, kind, visibility, line_start, line_end
              FROM ast_symbols
-             WHERE name LIKE ?1 AND kind LIKE ?2 AND file_path LIKE ?3
+             WHERE (?1 IS NULL OR name LIKE ?1 ESCAPE '\\')
+               AND (?2 IS NULL OR kind = ?2)
+               AND (?3 IS NULL OR file_path LIKE ?3 ESCAPE '\\')
              ORDER BY file_path ASC, line_start ASC
              LIMIT ?4",
         )?;
 
         #[allow(clippy::cast_possible_wrap)]
-        let rows = stmt.query_map(params![name_pat, kind_pat, file_pat, limit as i64], |row| {
-            let line_start: i64 = row.get(4)?;
-            let line_end: i64 = row.get(5)?;
-            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-            Ok(RustSymbol {
-                file: row.get(0)?,
-                name: row.get(1)?,
-                kind: row.get(2)?,
-                visibility: row.get(3)?,
-                line_start: line_start.max(0) as usize,
-                line_end: line_end.max(0) as usize,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![name_pat, kind_filter, file_pat, limit as i64],
+            |row| {
+                let line_start: i64 = row.get(4)?;
+                let line_end: i64 = row.get(5)?;
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                Ok(RustSymbol {
+                    file: row.get(0)?,
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    visibility: row.get(3)?,
+                    line_start: line_start.max(0) as usize,
+                    line_end: line_end.max(0) as usize,
+                })
+            },
+        )?;
 
         let mut out = Vec::new();
         for r in rows {
@@ -463,8 +493,35 @@ impl StateStore {
     }
 }
 
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 fn normalize_rel(path: &str) -> String {
-    path.replace('\\', "/")
+    let replaced = path.replace('\\', "/");
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in replaced.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                let _ = parts.pop();
+            }
+            seg => parts.push(seg),
+        }
+    }
+    let joined = parts.join("/");
+    if cfg!(windows) {
+        joined.to_ascii_lowercase()
+    } else {
+        joined
+    }
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -558,5 +615,105 @@ mod tests {
         assert_eq!(store.list_dirty_files().expect("list dirty").len(), 1);
         store.clear_dirty_files().expect("clear");
         assert!(store.list_dirty_files().expect("empty").is_empty());
+    }
+
+    #[test]
+    fn query_symbols_escapes_like_wildcards_and_uses_exact_kind() {
+        let mut store = StateStore::open_in_memory().expect("in-memory");
+        let syms = [
+            RustSymbol {
+                file: "src/hook_runner.rs".to_string(),
+                name: "raw_op".to_string(),
+                kind: "unsafe_fn".to_string(),
+                visibility: "pub".to_string(),
+                line_start: 1,
+                line_end: 3,
+            },
+            RustSymbol {
+                file: "src/hookXrunner.rs".to_string(),
+                name: "safe_op".to_string(),
+                kind: "fn".to_string(),
+                visibility: "pub".to_string(),
+                line_start: 5,
+                line_end: 8,
+            },
+        ];
+        store
+            .replace_file_symbols("src/hook_runner.rs", 1, &syms[..1])
+            .expect("index 1");
+        store
+            .replace_file_symbols("src/hookXrunner.rs", 1, &syms[1..])
+            .expect("index 2");
+
+        // Exact kind filter must NOT accept `%` wildcard.
+        assert!(store
+            .query_symbols(None, Some("%"), None, 10)
+            .expect("query")
+            .is_empty());
+
+        // `_` in file filter must match literal underscore, not `X`.
+        let matched = store
+            .query_symbols(None, None, Some("hook_runner"), 10)
+            .expect("query underscore");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "raw_op");
+    }
+
+    #[test]
+    fn canonicalizes_lock_paths_and_serializes_concurrent_wal_acquisitions() {
+        let dir =
+            std::env::temp_dir().join(format!("vektor-wal-contention-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Verify canonical path normalization prevents lock bypasses (`./src//lib.rs` == `src/lib.rs`).
+        {
+            let mut s = StateStore::open_workspace(&dir).expect("open");
+            assert!(s
+                .acquire_lock("./src//lib.rs", "agent-a", "edit", Some(60))
+                .expect("acquire")
+                .is_ok());
+            assert!(s
+                .acquire_lock("src/lib.rs", "agent-b", "edit", Some(60))
+                .expect("conflict")
+                .is_err());
+            assert_eq!(
+                s.release_lock("src/lib.rs", Some("agent-a")).expect("rel"),
+                1
+            );
+        }
+
+        // 12 threads race on the same file lock against the shared WAL database.
+        let threads = 12usize;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let mut handles = Vec::with_capacity(threads);
+
+        for i in 0..threads {
+            let dir_clone = dir.clone();
+            let bar = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let mut store = StateStore::open_workspace(&dir_clone).expect("open wal");
+                let agent = format!("agent-{i}");
+                bar.wait();
+                store
+                    .acquire_lock("crates/vektor-cli/src/main.rs", &agent, "race", Some(60))
+                    .expect("no sqlite error")
+            }));
+        }
+
+        let mut winners = Vec::new();
+        let mut losers = Vec::new();
+        for h in handles {
+            match h.join().expect("thread join") {
+                Ok(lock) => winners.push(lock.owner_agent),
+                Err(holder) => losers.push(holder.owner_agent),
+            }
+        }
+
+        assert_eq!(winners.len(), 1, "exactly one agent must win the lock");
+        assert_eq!(losers.len(), threads - 1);
+        assert!(losers.iter().all(|h| h == &winners[0]));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

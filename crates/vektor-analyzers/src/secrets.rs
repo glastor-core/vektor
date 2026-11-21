@@ -10,7 +10,6 @@ use serde::Serialize;
 
 use crate::Severity;
 
-const MAX_SCAN_FILE_BYTES: u64 = 1_048_576; // 1 MiB cap per file
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -40,6 +39,7 @@ struct SecretRule {
     regex: Regex,
 }
 
+#[allow(clippy::expect_used)]
 fn compiled_rules() -> &'static [SecretRule] {
     static RULES: OnceLock<Vec<SecretRule>> = OnceLock::new();
     RULES.get_or_init(|| {
@@ -48,15 +48,19 @@ fn compiled_rules() -> &'static [SecretRule] {
                 id: "SEC-PRIVATE-KEY",
                 severity: Severity::Critical,
                 message: "Private key material detected",
-                regex: Regex::new(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----")
-                    .expect("valid regex"),
+                regex: Regex::new(
+                    r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED |SSH2 ENCRYPTED )?PRIVATE KEY-----",
+                )
+                .expect("valid regex"),
             },
             SecretRule {
                 id: "SEC-GITHUB-TOKEN",
                 severity: Severity::Critical,
                 message: "GitHub personal access or app token detected",
-                regex: Regex::new(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{30,}\b")
-                    .expect("valid regex"),
+                regex: Regex::new(
+                    r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{30,}\b",
+                )
+                .expect("valid regex"),
             },
             SecretRule {
                 id: "SEC-AWS-KEY",
@@ -92,11 +96,12 @@ fn compiled_rules() -> &'static [SecretRule] {
     })
 }
 
+#[allow(clippy::expect_used)]
 fn generic_assignment_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|password|passwd)\b\s*[:=]\s*["']([^"'\s]{16,})["']"#,
+            r#"(?i)\b(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|private[_-]?key|password|passwd)\b\s*[:=]\s*(?:["']([^"'\s]{16,})["']|([^\s"'#,;]{16,}))"#,
         )
         .expect("valid regex")
     })
@@ -107,20 +112,30 @@ fn generic_assignment_regex() -> &'static Regex {
 /// Lines containing `vektor:ignore` (case-insensitive) are skipped.
 #[must_use]
 pub fn scan_text(source_label: &str, content: &str) -> Vec<SecretFinding> {
+    scan_text_with_options(source_label, content, true)
+}
+
+/// Scan raw text with explicit control over whether inline `vektor:ignore` directives are honored.
+#[must_use]
+pub fn scan_text_with_options(
+    source_label: &str,
+    content: &str,
+    allow_inline_ignore: bool,
+) -> Vec<SecretFinding> {
     let mut findings = Vec::new();
     let rules = compiled_rules();
     let generic_re = generic_assignment_regex();
 
     for (idx, line) in content.lines().enumerate() {
-        if line.to_ascii_lowercase().contains("vektor:ignore") {
+        if allow_inline_ignore && line.to_ascii_lowercase().contains("vektor:ignore") {
             continue;
         }
         let line_no = idx + 1;
-        let mut matched_specific = false;
+        let mut specific_spans: Vec<(usize, usize)> = Vec::new();
 
         for rule in rules {
-            if let Some(m) = rule.regex.find(line) {
-                matched_specific = true;
+            for m in rule.regex.find_iter(line) {
+                specific_spans.push((m.start(), m.end()));
                 findings.push(SecretFinding {
                     rule_id: rule.id.to_string(),
                     severity: rule.severity,
@@ -132,21 +147,26 @@ pub fn scan_text(source_label: &str, content: &str) -> Vec<SecretFinding> {
             }
         }
 
-        if !matched_specific {
-            if let Some(caps) = generic_re.captures(line) {
-                if let Some(val) = caps.get(1) {
-                    let candidate = val.as_str();
-                    if !looks_like_placeholder(candidate) && shannon_entropy(candidate) >= 3.5 {
-                        findings.push(SecretFinding {
-                            rule_id: "SEC-HIGH-ENTROPY".to_string(),
-                            severity: Severity::High,
-                            file: source_label.to_string(),
-                            line: line_no,
-                            message: "High-entropy credential assignment detected".to_string(),
-                            redacted_match: redact(candidate),
-                        });
-                    }
-                }
+        for caps in generic_re.captures_iter(line) {
+            let Some(val) = caps.get(1).or_else(|| caps.get(2)) else {
+                continue;
+            };
+            let overlaps_specific = specific_spans
+                .iter()
+                .any(|&(s, e)| val.start() < e && val.end() > s);
+            if overlaps_specific {
+                continue;
+            }
+            let candidate = val.as_str();
+            if !looks_like_placeholder(candidate) && shannon_entropy(candidate) >= 3.5 {
+                findings.push(SecretFinding {
+                    rule_id: "SEC-HIGH-ENTROPY".to_string(),
+                    severity: Severity::High,
+                    file: source_label.to_string(),
+                    line: line_no,
+                    message: "High-entropy credential assignment detected".to_string(),
+                    redacted_match: redact(candidate),
+                });
             }
         }
     }
@@ -155,11 +175,11 @@ pub fn scan_text(source_label: &str, content: &str) -> Vec<SecretFinding> {
 }
 
 /// Recursively scan a file or directory for hardcoded secrets.
-/// Respects optional `.vektorignore` patterns at `target` root.
+/// Respects optional `.vektorignore` patterns at `target` root and skips symlinks.
 pub fn scan_path(target: &Path) -> Result<Vec<SecretFinding>> {
     let ignore_patterns = load_ignore_patterns(target);
     let mut findings = Vec::new();
-    scan_recursive(target, target, &ignore_patterns, &mut findings)?;
+    scan_recursive(target, target, 0, &ignore_patterns, &mut findings)?;
     Ok(findings)
 }
 
@@ -170,7 +190,7 @@ fn load_ignore_patterns(root: &Path) -> Vec<String> {
         root.parent()
             .map_or_else(|| root.join(".vektorignore"), |p| p.join(".vektorignore"))
     };
-    let Ok(content) = std::fs::read_to_string(ignore_file) else {
+    let Ok(Some(content)) = crate::read_bounded_utf8(&ignore_file, 65_536) else {
         return Vec::new();
     };
     content
@@ -200,9 +220,13 @@ fn is_ignored(rel_path: &str, patterns: &[String]) -> bool {
 fn scan_recursive(
     root: &Path,
     current: &Path,
+    depth: usize,
     ignore_patterns: &[String],
     findings: &mut Vec<SecretFinding>,
 ) -> Result<()> {
+    if depth > crate::MAX_WALK_DEPTH {
+        return Ok(());
+    }
     if let Ok(rel_path) = current.strip_prefix(root) {
         let rel_str = rel_path.display().to_string().replace('\\', "/");
         if !rel_str.is_empty() && is_ignored(&rel_str, ignore_patterns) {
@@ -210,19 +234,14 @@ fn scan_recursive(
         }
     }
 
-    if current.is_file() {
-        let meta = std::fs::metadata(current)?;
-        if meta.len() > MAX_SCAN_FILE_BYTES {
-            return Ok(());
-        }
-        let Ok(bytes) = std::fs::read(current) else {
-            return Ok(());
-        };
-        // Skip binary files containing null bytes.
-        if bytes.contains(&0) {
-            return Ok(());
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
+    let meta = std::fs::symlink_metadata(current)?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Ok(());
+    }
+
+    if ft.is_file() {
+        let Some(text) = crate::read_bounded_utf8(current, crate::MAX_SCAN_FILE_BYTES)? else {
             return Ok(());
         };
         let rel = current
@@ -239,18 +258,22 @@ fn scan_recursive(
         return Ok(());
     }
 
-    if current.is_dir() {
+    if ft.is_dir() {
         for entry in std::fs::read_dir(current)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let entry_ft = entry.file_type()?;
+            if entry_ft.is_symlink() {
+                continue;
+            }
+            if entry_ft.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if SKIP_DIRS.contains(&name) {
                         continue;
                     }
                 }
             }
-            scan_recursive(root, &path, ignore_patterns, findings)?;
+            scan_recursive(root, &path, depth + 1, ignore_patterns, findings)?;
         }
     }
 
@@ -259,12 +282,11 @@ fn scan_recursive(
 
 fn redact(secret: &str) -> String {
     let chars: Vec<char> = secret.chars().collect();
-    if chars.len() <= 8 {
+    if chars.len() <= 12 {
         return "***".to_string();
     }
-    let prefix: String = chars[..4].iter().collect();
-    let suffix: String = chars[chars.len() - 4..].iter().collect();
-    format!("{prefix}...{suffix}")
+    let prefix: String = chars[..3].iter().collect();
+    format!("{prefix}...****")
 }
 
 fn looks_like_placeholder(s: &str) -> bool {
@@ -311,8 +333,8 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "SEC-GITHUB-TOKEN");
         assert_eq!(findings[0].severity, Severity::Critical);
-        assert!(findings[0].redacted_match.starts_with("ghp_"));
-        assert!(findings[0].redacted_match.contains("..."));
+        assert!(findings[0].redacted_match.starts_with("ghp"));
+        assert!(findings[0].redacted_match.ends_with("****"));
     }
 
     #[test]
@@ -323,25 +345,28 @@ mod tests {
     }
 
     #[test]
-    fn detects_high_entropy_generic_secret() {
+    fn detects_high_entropy_quoted_unquoted_and_multi_match_per_line() {
         let secret = ["9fK2mP7qR4", "xL8vN1wZ6c", "B3tY5hJ0dS"].concat();
-        let content = format!("secret_key = \"{secret}\"");
+        let content = format!("api_key=\"your_example_placeholder_key\", secret_key={secret}");
         let findings = scan_text("env.rs", &content);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "SEC-HIGH-ENTROPY");
     }
 
     #[test]
-    fn respects_inline_vektor_ignore_directive() {
+    fn respects_inline_vektor_ignore_directive_only_when_allowed() {
         let token = ["ghp_", "1234567890", "abcdefghijklmnoPQRST"].concat();
         let content = format!("const FIXTURE: &str = \"{token}\"; // vektor:ignore");
-        let findings = scan_text("test.rs", &content);
-        assert!(findings.is_empty());
+        assert!(scan_text("test.rs", &content).is_empty());
+        assert_eq!(
+            scan_text_with_options("run_command", &content, false).len(),
+            1
+        );
     }
 
     #[test]
     fn respects_vektorignore_file() {
-        let dir = std::env::temp_dir().join("vektor-ignore-test");
+        let dir = std::env::temp_dir().join(format!("vektor-ignore-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("fixtures")).expect("mkdir");
         std::fs::write(dir.join(".vektorignore"), "# comment\nfixtures/\n").expect("write ignore");

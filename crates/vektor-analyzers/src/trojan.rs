@@ -7,7 +7,6 @@ use serde::Serialize;
 
 use crate::Severity;
 
-const MAX_SCAN_FILE_BYTES: u64 = 1_048_576;
 const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules", ".vektor", "dist", "build"];
 
 /// A Trojan Source / invisible Unicode character finding.
@@ -25,6 +24,7 @@ pub struct TrojanFinding {
 
 fn classify_dangerous_char(
     ch: char,
+    allow_leading_bom: bool,
     is_file_start: bool,
 ) -> Option<(&'static str, Severity, &'static str)> {
     match ch {
@@ -35,28 +35,65 @@ fn classify_dangerous_char(
                 "Unicode bidirectional control character detected (Trojan Source / CVE-2021-42574 risk)",
             ))
         }
-        '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' => Some((
+        '\u{E0000}'..='\u{E007F}' => Some((
+            "TROJAN-UNICODE-TAG",
+            Severity::Critical,
+            "Invisible Unicode Tag character detected (prompt/code smuggling risk)",
+        )),
+        '\u{2028}' | '\u{2029}' => Some((
+            "TROJAN-LINE-SEP",
+            Severity::High,
+            "Unicode line/paragraph separator detected (line-splitting obfuscation risk)",
+        )),
+        '\u{001B}' => Some((
+            "TROJAN-ANSI-ESC",
+            Severity::High,
+            "Raw ANSI escape character (U+001B) detected in source",
+        )),
+        '\u{200B}'
+        | '\u{200C}'
+        | '\u{200D}'
+        | '\u{2060}'..='\u{2064}'
+        | '\u{00AD}'
+        | '\u{034F}'
+        | '\u{180E}'
+        | '\u{3164}'
+        | '\u{FFA0}'
+        | '\u{FE00}'..='\u{FE0F}'
+        | '\u{E0100}'..='\u{E01EF}' => Some((
             "TROJAN-INVISIBLE",
             Severity::High,
-            "Invisible zero-width Unicode character detected in source",
+            "Invisible zero-width or formatting Unicode character detected in source",
         )),
-        '\u{FEFF}' if !is_file_start => Some((
+        '\u{FEFF}' if !(allow_leading_bom && is_file_start) => Some((
             "TROJAN-MID-BOM",
             Severity::High,
-            "Mid-file UTF-8 BOM (U+FEFF) detected in source",
+            "Unexpected UTF-8 BOM (U+FEFF) detected in source",
         )),
         _ => None,
     }
 }
 
-/// Scan raw text for Trojan Source `BiDi` and invisible Unicode characters.
+/// Scan raw text for Trojan Source `BiDi`, Unicode Tag, and invisible characters.
 #[must_use]
 pub fn scan_text(source_label: &str, content: &str) -> Vec<TrojanFinding> {
+    scan_text_with_options(source_label, content, true)
+}
+
+/// Scan raw text with control over whether a leading UTF-8 BOM at byte 0 is allowed.
+#[must_use]
+pub fn scan_text_with_options(
+    source_label: &str,
+    content: &str,
+    allow_leading_bom: bool,
+) -> Vec<TrojanFinding> {
     let mut findings = Vec::new();
     for (line_idx, line) in content.lines().enumerate() {
         for (col_idx, ch) in line.chars().enumerate() {
             let is_file_start = line_idx == 0 && col_idx == 0;
-            if let Some((rule_id, severity, message)) = classify_dangerous_char(ch, is_file_start) {
+            if let Some((rule_id, severity, message)) =
+                classify_dangerous_char(ch, allow_leading_bom, is_file_start)
+            {
                 findings.push(TrojanFinding {
                     rule_id: rule_id.to_string(),
                     severity,
@@ -75,23 +112,26 @@ pub fn scan_text(source_label: &str, content: &str) -> Vec<TrojanFinding> {
 /// Recursively scan a file or directory for Trojan Source / invisible Unicode characters.
 pub fn scan_path(target: &Path) -> Result<Vec<TrojanFinding>> {
     let mut findings = Vec::new();
-    scan_recursive(target, target, &mut findings)?;
+    scan_recursive(target, target, 0, &mut findings)?;
     Ok(findings)
 }
 
-fn scan_recursive(root: &Path, current: &Path, findings: &mut Vec<TrojanFinding>) -> Result<()> {
-    if current.is_file() {
-        let meta = std::fs::metadata(current)?;
-        if meta.len() > MAX_SCAN_FILE_BYTES {
-            return Ok(());
-        }
-        let Ok(bytes) = std::fs::read(current) else {
-            return Ok(());
-        };
-        if bytes.contains(&0) {
-            return Ok(());
-        }
-        let Ok(text) = String::from_utf8(bytes) else {
+fn scan_recursive(
+    root: &Path,
+    current: &Path,
+    depth: usize,
+    findings: &mut Vec<TrojanFinding>,
+) -> Result<()> {
+    if depth > crate::MAX_WALK_DEPTH {
+        return Ok(());
+    }
+    let meta = std::fs::symlink_metadata(current)?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Ok(());
+    }
+    if ft.is_file() {
+        let Some(text) = crate::read_bounded_utf8(current, crate::MAX_SCAN_FILE_BYTES)? else {
             return Ok(());
         };
         let rel = current
@@ -109,18 +149,22 @@ fn scan_recursive(root: &Path, current: &Path, findings: &mut Vec<TrojanFinding>
         return Ok(());
     }
 
-    if current.is_dir() {
+    if ft.is_dir() {
         for entry in std::fs::read_dir(current)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let entry_ft = entry.file_type()?;
+            if entry_ft.is_symlink() {
+                continue;
+            }
+            if entry_ft.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     if SKIP_DIRS.contains(&name) {
                         continue;
                     }
                 }
             }
-            scan_recursive(root, &path, findings)?;
+            scan_recursive(root, &path, depth + 1, findings)?;
         }
     }
 
@@ -146,5 +190,22 @@ mod tests {
     fn allows_clean_ascii_and_spanish_utf8() {
         let clean = "// Código limpio en español: ñ, á, é, í, ó, ú\nfn main() {}\n";
         assert!(scan_text("src/main.rs", clean).is_empty());
+    }
+
+    #[test]
+    fn detects_unicode_tags_line_sep_ansi_and_mid_bom() {
+        let with_leading_bom = "\u{FEFF}fn ok() {}";
+        assert!(scan_text("src/lib.rs", with_leading_bom).is_empty());
+        assert_eq!(
+            scan_text_with_options("edit_fragment", with_leading_bom, false).len(),
+            1
+        );
+
+        let smuggled = "let a = 1;\u{E0001}\u{2028}\u{001B}";
+        let findings = scan_text("src/smuggle.rs", smuggled);
+        let ids: Vec<&str> = findings.iter().map(|f| f.rule_id.as_str()).collect();
+        assert!(ids.contains(&"TROJAN-UNICODE-TAG"));
+        assert!(ids.contains(&"TROJAN-LINE-SEP"));
+        assert!(ids.contains(&"TROJAN-ANSI-ESC"));
     }
 }

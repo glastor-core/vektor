@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 fn vektor_bin() -> &'static str {
     env!("CARGO_BIN_EXE_vektor")
@@ -72,63 +72,166 @@ fn e2e_mcp_stdio_initialize_list_and_health() {
 }
 
 #[test]
-fn e2e_hook_pre_tool_use_blocks_force_push_and_allows_cargo_test() {
-    let deny_payload = r#"{
-        "hookEventName": "PreToolUse",
-        "toolCall": {
-            "id": "call_1",
-            "name": "run_command",
-            "args": { "CommandLine": "git push --force origin main" }
-        }
-    }"#;
+fn e2e_hook_pre_tool_use_blocks_force_push_malformed_json_and_allows_cargo_test() {
+    let run_hook = |payload: &str| -> Value {
+        let mut child = Command::new(vektor_bin())
+            .args(["hook", "pre-tool-use"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn hook");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+            .expect("write");
+        let out = child.wait_with_output().expect("wait");
+        assert!(out.status.success());
+        serde_json::from_slice(&out.stdout).expect("json")
+    };
 
-    let mut deny_child = Command::new(vektor_bin())
-        .args(["hook", "pre-tool-use"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn hook deny");
-    deny_child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(deny_payload.as_bytes())
-        .expect("write");
-    let deny_out = deny_child.wait_with_output().expect("wait");
-    assert!(deny_out.status.success());
-    let deny_json: Value = serde_json::from_slice(&deny_out.stdout).expect("json");
+    let deny_json = run_hook(
+        r#"{
+            "hookEventName": "PreToolUse",
+            "toolCall": {
+                "id": "call_1",
+                "name": "run_command",
+                "args": { "CommandLine": "git push --force origin main" }
+            }
+        }"#,
+    );
     assert_eq!(deny_json["decision"], "deny");
 
-    let allow_payload = r#"{
-        "hookEventName": "PreToolUse",
-        "toolCall": {
-            "id": "call_2",
-            "name": "run_command",
-            "args": { "CommandLine": "cargo test --workspace" }
-        }
-    }"#;
+    let malformed_json = run_hook("{not valid json");
+    assert_eq!(malformed_json["decision"], "deny");
 
-    let mut allow_child = Command::new(vektor_bin())
-        .args(["hook", "pre-tool-use"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn hook allow");
-    allow_child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(allow_payload.as_bytes())
-        .expect("write");
-    let allow_out = allow_child.wait_with_output().expect("wait");
-    assert!(allow_out.status.success());
-    let allow_json: Value = serde_json::from_slice(&allow_out.stdout).expect("json");
+    let allow_json = run_hook(
+        r#"{
+            "hookEventName": "PreToolUse",
+            "toolCall": {
+                "id": "call_2",
+                "name": "run_command",
+                "args": { "CommandLine": "cargo test --workspace" }
+            }
+        }"#,
+    );
     assert_eq!(allow_json["decision"], "allow");
 }
 
 #[test]
+fn e2e_post_tool_use_and_stop_quality_gate_lifecycle() {
+    let dir = std::env::temp_dir().join(format!("vektor-e2e-stop-gate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write cargo.toml");
+
+    let lib_rs = dir.join("src/lib.rs");
+    // 1. Write broken Rust file and notify PostToolUse.
+    std::fs::write(&lib_rs, "pub fn broken() -> i32 { \"not_an_int\" }\n").expect("write broken");
+
+    let post_payload = json!({
+        "hookEventName": "PostToolUse",
+        "workspacePaths": [dir.display().to_string()],
+        "cwd": dir.display().to_string(),
+        "toolCall": {
+            "id": "p1",
+            "name": "write_file",
+            "args": { "Path": lib_rs.display().to_string() }
+        }
+    });
+    let mut post_child = Command::new(vektor_bin())
+        .args(["hook", "post-tool-use"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn post-tool-use");
+    post_child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(post_payload.to_string().as_bytes())
+        .expect("write");
+    assert!(post_child
+        .wait_with_output()
+        .expect("wait")
+        .status
+        .success());
+
+    // 2. Stop gate must catch the compilation error and force continuation.
+    let stop_payload = json!({
+        "hookEventName": "Stop",
+        "terminationReason": "NO_TOOL_CALL",
+        "continuationActive": false,
+        "workspacePaths": [dir.display().to_string()],
+        "cwd": dir.display().to_string()
+    });
+    let mut stop_fail = Command::new(vektor_bin())
+        .args(["hook", "stop"])
+        .env_remove("VEKTOR_STOP_GATE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn stop fail");
+    stop_fail
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(stop_payload.to_string().as_bytes())
+        .expect("write");
+    let stop_fail_out = stop_fail.wait_with_output().expect("wait");
+    assert!(stop_fail_out.status.success());
+    let stop_fail_json: Value = serde_json::from_slice(&stop_fail_out.stdout).expect("json");
+    assert_eq!(stop_fail_json["decision"], "continue");
+
+    // 3. Respect VEKTOR_STOP_GATE=off override.
+    let mut stop_off = Command::new(vektor_bin())
+        .args(["hook", "stop"])
+        .env("VEKTOR_STOP_GATE", "off")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn stop off");
+    stop_off
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(stop_payload.to_string().as_bytes())
+        .expect("write");
+    let stop_off_json: Value =
+        serde_json::from_slice(&stop_off.wait_with_output().expect("wait").stdout).expect("json");
+    assert_eq!(stop_off_json["decision"], "allow");
+
+    // 4. Fix compilation error -> Stop gate allows stopping and clears dirty files.
+    std::fs::write(&lib_rs, "pub fn fixed() -> i32 { 42 }\n").expect("write fixed");
+    let mut stop_ok = Command::new(vektor_bin())
+        .args(["hook", "stop"])
+        .env_remove("VEKTOR_STOP_GATE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn stop ok");
+    stop_ok
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(stop_payload.to_string().as_bytes())
+        .expect("write");
+    let stop_ok_json: Value =
+        serde_json::from_slice(&stop_ok.wait_with_output().expect("wait").stdout).expect("json");
+    assert_eq!(stop_ok_json["decision"], "allow");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn e2e_audit_sarif_and_fail_on_threshold() {
-    let dir = std::env::temp_dir().join("vektor-e2e-audit-test");
+    let dir = std::env::temp_dir().join(format!("vektor-e2e-audit-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
 

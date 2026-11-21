@@ -3,6 +3,7 @@ mod mcp_server;
 
 use std::io;
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
@@ -95,9 +96,7 @@ impl From<HookEventArg> for HookEvent {
     }
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-
+fn run(cli: Cli) -> Result<ExitCode> {
     match cli.command {
         Commands::Mcp => {
             let server = mcp_server::build_server();
@@ -163,11 +162,22 @@ fn main() -> Result<()> {
                     eprintln!(
                         "vektor audit failed: {failing_count} finding(s) met or exceeded severity threshold {threshold:?}"
                     );
-                    std::process::exit(1);
+                    return Ok(ExitCode::FAILURE);
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("vektor error: {err:#}");
+            ExitCode::FAILURE
+        }
+    }
 }

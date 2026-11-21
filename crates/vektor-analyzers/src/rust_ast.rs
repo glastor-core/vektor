@@ -43,10 +43,11 @@ pub fn extract_symbols(file_label: &str, source: &str) -> Result<Vec<RustSymbol>
     Ok(symbols)
 }
 
-/// Extract Rust symbols from a single `.rs` file on disk.
+/// Extract Rust symbols from a single `.rs` file on disk (bounded, skips symlinks).
 pub fn extract_file(root: &Path, file_path: &Path) -> Result<Vec<RustSymbol>> {
-    let source = std::fs::read_to_string(file_path)
-        .with_context(|| format!("Failed to read {}", file_path.display()))?;
+    let Some(source) = crate::read_bounded_utf8(file_path, crate::MAX_SCAN_FILE_BYTES)? else {
+        return Ok(Vec::new());
+    };
     let label = file_path
         .strip_prefix(root)
         .unwrap_or(file_path)
@@ -56,15 +57,23 @@ pub fn extract_file(root: &Path, file_path: &Path) -> Result<Vec<RustSymbol>> {
     extract_symbols(&label, &source)
 }
 
-/// Recursively collect all `.rs` files under `root` (skipping `target/`, `.git/`, etc.).
+/// Recursively collect all `.rs` files under `root` (skipping symlinks, `target/`, `.git/`, etc.).
 pub fn collect_rust_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut files = Vec::new();
-    collect_recursive(root, &mut files)?;
+    collect_recursive(root, 0, &mut files)?;
     Ok(files)
 }
 
-fn collect_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
-    if dir.is_file() {
+fn collect_recursive(dir: &Path, depth: usize, out: &mut Vec<std::path::PathBuf>) -> Result<()> {
+    if depth > crate::MAX_WALK_DEPTH {
+        return Ok(());
+    }
+    let meta = std::fs::symlink_metadata(dir)?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        return Ok(());
+    }
+    if ft.is_file() {
         if dir
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
@@ -74,21 +83,25 @@ fn collect_recursive(dir: &Path, out: &mut Vec<std::path::PathBuf>) -> Result<()
         return Ok(());
     }
 
-    if !dir.is_dir() {
+    if !ft.is_dir() {
         return Ok(());
     }
 
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let entry_ft = entry.file_type()?;
+        if entry_ft.is_symlink() {
+            continue;
+        }
+        if entry_ft.is_dir() {
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                 if SKIP_DIRS.contains(&name) {
                     continue;
                 }
             }
         }
-        collect_recursive(&path, out)?;
+        collect_recursive(&path, depth + 1, out)?;
     }
     Ok(())
 }
@@ -355,6 +368,55 @@ pub fn diff_public_api(before: &[PublicApiItem], after: &[PublicApiItem]) -> Api
 
 /// Compare the current workspace's public Rust API against a git revision (e.g. `HEAD`).
 pub fn diff_workspace_against_git(root: &Path, git_ref: &str) -> Result<ApiDiffReport> {
+    if git_ref.is_empty()
+        || git_ref.starts_with('-')
+        || git_ref.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        anyhow::bail!("Invalid git revision: {git_ref:?}");
+    }
+
+    let tree_spec = format!("{git_ref}^{{tree}}");
+    let rev_out = Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            "--end-of-options",
+            &tree_spec,
+        ])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("Failed to execute git rev-parse in {}", root.display()))?;
+
+    if !rev_out.status.success() {
+        anyhow::bail!("Unknown or invalid git revision `{git_ref}`");
+    }
+
+    let tree_oid = String::from_utf8(rev_out.stdout)
+        .context("git rev-parse output was not UTF-8")?
+        .trim()
+        .to_string();
+    if !matches!(tree_oid.len(), 40 | 64) || !tree_oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("Unexpected git tree OID: `{tree_oid}`");
+    }
+
+    let ls_out = Command::new("git")
+        .args([
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "--end-of-options",
+            &tree_oid,
+        ])
+        .current_dir(root)
+        .output()
+        .context("Failed to execute git ls-tree")?;
+
+    if !ls_out.status.success() {
+        let stderr = String::from_utf8_lossy(&ls_out.stderr);
+        anyhow::bail!("git ls-tree failed: {}", stderr.trim());
+    }
+
     let files = collect_rust_files(root)?;
     let mut all_rel_paths = std::collections::BTreeSet::new();
     let mut after = Vec::new();
@@ -368,48 +430,33 @@ pub fn diff_workspace_against_git(root: &Path, git_ref: &str) -> Result<ApiDiffR
             .replace('\\', "/");
         all_rel_paths.insert(rel.clone());
 
-        if let Ok(current_src) = std::fs::read_to_string(&file) {
-            if let Ok(items) = extract_public_api(&rel, &current_src) {
-                after.extend(items);
-            }
+        if let Some(current_src) = crate::read_bounded_utf8(&file, crate::MAX_SCAN_FILE_BYTES)? {
+            after.extend(extract_public_api(&rel, &current_src)?);
         }
     }
 
-    // Also include `.rs` files present in `git_ref` so deleted files are detected as breaking removals.
-    if let Ok(out) = Command::new("git")
-        .args(["ls-tree", "-r", "--name-only", git_ref])
-        .current_dir(root)
-        .output()
-    {
-        if out.status.success() {
-            if let Ok(listing) = String::from_utf8(out.stdout) {
-                for line in listing.lines() {
-                    let trimmed = line.trim();
-                    if Path::new(trimmed)
-                        .extension()
-                        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
-                    {
-                        all_rel_paths.insert(trimmed.replace('\\', "/"));
-                    }
-                }
-            }
+    let listing = String::from_utf8(ls_out.stdout).context("git ls-tree output was not UTF-8")?;
+    for line in listing.lines() {
+        let trimmed = line.trim();
+        if Path::new(trimmed)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        {
+            all_rel_paths.insert(trimmed.replace('\\', "/"));
         }
     }
 
     let mut before = Vec::new();
     for rel in all_rel_paths {
-        let spec = format!("{git_ref}:{rel}");
-        if let Ok(out) = Command::new("git")
-            .args(["show", &spec])
+        let spec = format!("{tree_oid}:{rel}");
+        let out = Command::new("git")
+            .args(["cat-file", "blob", "--end-of-options", &spec])
             .current_dir(root)
             .output()
-        {
-            if out.status.success() {
-                if let Ok(old_src) = String::from_utf8(out.stdout) {
-                    if let Ok(items) = extract_public_api(&rel, &old_src) {
-                        before.extend(items);
-                    }
-                }
+            .context("Failed to execute git cat-file")?;
+        if out.status.success() {
+            if let Ok(old_src) = String::from_utf8(out.stdout) {
+                before.extend(extract_public_api(&rel, &old_src)?);
             }
         }
     }
@@ -494,5 +541,55 @@ pub enum Mode {
 
         assert_eq!(diff.recommended_bump, "major");
         assert_eq!(diff.breaking_changes.len(), 2);
+    }
+
+    #[test]
+    fn diff_workspace_rejects_flag_injection_and_detects_deleted_git_file() {
+        let dir = std::env::temp_dir().join(format!("vektor-git-diff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+
+        // Reject git flag injection immediately before spawning git.
+        assert!(diff_workspace_against_git(&dir, "--output=pwned.txt").is_err());
+        assert!(diff_workspace_against_git(&dir, "").is_err());
+
+        // Initialize a real temp git repo, commit 2 files, delete one, add a pub fn to the other.
+        let run_git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .expect("run git");
+            assert!(status.success(), "git {args:?} failed");
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.email", "test@vektor.local"]);
+        run_git(&["config", "user.name", "Vektor Test"]);
+
+        std::fs::write(dir.join("src/lib.rs"), "pub fn keep() {}\n").expect("write lib");
+        std::fs::write(dir.join("src/removed.rs"), "pub fn gone() {}\n").expect("write removed");
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "--no-gpg-sign", "-m", "initial"]);
+
+        std::fs::remove_file(dir.join("src/removed.rs")).expect("delete removed");
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            "pub fn keep() {}\npub fn added() {}\n",
+        )
+        .expect("update lib");
+
+        let report = diff_workspace_against_git(&dir, "HEAD").expect("diff against HEAD");
+        assert_eq!(report.recommended_bump, "major");
+        assert!(report
+            .breaking_changes
+            .iter()
+            .any(|c| c.contains("gone") && c.contains("src/removed.rs")));
+        assert!(report
+            .additive_changes
+            .iter()
+            .any(|c| c.contains("added") && c.contains("src/lib.rs")));
+
+        assert!(diff_workspace_against_git(&dir, "nonexistent-ref-xyz").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

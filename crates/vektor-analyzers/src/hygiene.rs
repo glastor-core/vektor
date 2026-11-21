@@ -161,7 +161,7 @@ mod tests {
 
     #[test]
     fn computes_hygiene_score_on_temp_dir() {
-        let dir = std::env::temp_dir().join("vektor-hygiene-test");
+        let dir = std::env::temp_dir().join(format!("vektor-hygiene-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::write(dir.join("README.md"), "# Test").expect("readme");

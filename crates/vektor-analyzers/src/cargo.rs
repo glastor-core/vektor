@@ -92,7 +92,8 @@ fn run_cargo_metadata(workspace_root: &Path, offline: bool) -> Result<String> {
     }
 
     let mut cmd = Command::new("cargo");
-    cmd.arg("metadata")
+    cmd.current_dir(workspace_root)
+        .arg("metadata")
         .arg("--format-version")
         .arg("1")
         .arg("--manifest-path")
@@ -346,8 +347,9 @@ pub fn analyze_metadata_json(raw_json: &str) -> Result<CargoAuditReport> {
 
 fn is_copyleft(license: &str) -> bool {
     let upper = license.to_ascii_uppercase();
-    // Flag strong copyleft unless dual-licensed with permissive terms via OR.
-    let has_permissive_or = upper.contains(" OR ")
+    // Flag strong copyleft unless dual-licensed with permissive terms via OR (not AND).
+    let has_permissive_or = !upper.contains(" AND ")
+        && upper.contains(" OR ")
         && (upper.contains("MIT") || upper.contains("APACHE-2.0") || upper.contains("BSD"));
     if has_permissive_or {
         return false;
@@ -471,5 +473,40 @@ mod tests {
         .expect("compute affected");
 
         assert_eq!(affected, vec!["app".to_string(), "foo-bar".to_string()]);
+    }
+
+    #[test]
+    fn generates_cyclonedx_1_5_and_flags_gpl_and_mit() {
+        assert!(!is_copyleft("MIT OR GPL-3.0-only"));
+        assert!(is_copyleft("GPL-3.0-only AND MIT"));
+        assert!(is_copyleft("AGPL-3.0-or-later"));
+
+        let sample = r#"{
+            "workspace_members": ["app 0.1.0"],
+            "packages": [
+                {
+                    "id": "app 0.1.0",
+                    "name": "app",
+                    "version": "0.1.0",
+                    "license": "MIT",
+                    "dependencies": []
+                },
+                {
+                    "id": "serde 1.0.0",
+                    "name": "serde",
+                    "version": "1.0.0",
+                    "license": "MIT OR Apache-2.0",
+                    "dependencies": []
+                }
+            ]
+        }"#;
+        let sbom = cyclonedx_from_metadata_json(sample).expect("sbom");
+        assert_eq!(sbom["bomFormat"], "CycloneDX");
+        assert_eq!(sbom["specVersion"], "1.5");
+        let components = sbom["components"].as_array().expect("components");
+        assert_eq!(components.len(), 2);
+        assert_eq!(components[0]["type"], "application");
+        assert_eq!(components[1]["type"], "library");
+        assert_eq!(components[1]["purl"], "pkg:cargo/serde@1.0.0");
     }
 }

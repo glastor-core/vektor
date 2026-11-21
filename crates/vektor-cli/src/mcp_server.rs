@@ -7,7 +7,7 @@ use vektor_core::mcp::{McpServer, ToolDefinition, ToolHandler, ToolResult};
 use vektor_state::StateStore;
 
 #[must_use]
-pub fn build_server() -> McpServer {
+pub(crate) fn build_server() -> McpServer {
     let mut server = McpServer::new("vektor", env!("CARGO_PKG_VERSION"));
     server.register(HealthTool);
     server.register(WorkspaceInfoTool);
@@ -27,7 +27,7 @@ pub fn build_server() -> McpServer {
 
 /// Collect real, deterministic workspace metadata (Cargo, Git, GitHub Actions).
 #[must_use]
-pub fn collect_workspace_summary(root: &Path) -> Value {
+pub(crate) fn collect_workspace_summary(root: &Path) -> Value {
     let has_cargo_toml = root.join("Cargo.toml").is_file();
     let has_cargo_lock = root.join("Cargo.lock").is_file();
     let has_git = root.join(".git").exists();
@@ -84,6 +84,20 @@ fn file_mtime_secs(path: &Path) -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+fn ok_json<T: serde::Serialize>(val: &T) -> ToolResult {
+    match serde_json::to_string_pretty(val) {
+        Ok(s) => ToolResult::ok(s),
+        Err(err) => ToolResult::err(format!("JSON serialization failed: {err}")),
+    }
+}
+
+fn err_json<T: serde::Serialize>(val: &T) -> ToolResult {
+    match serde_json::to_string_pretty(val) {
+        Ok(s) => ToolResult::err(s),
+        Err(err) => ToolResult::err(format!("JSON serialization failed: {err}")),
+    }
+}
+
 /// Incrementally refresh the `SQLite` WAL Rust AST index for all changed `.rs` files in `root`
 /// and prune entries for files deleted from disk.
 fn refresh_ast_index(root: &Path, store: &mut StateStore) -> anyhow::Result<usize> {
@@ -99,12 +113,17 @@ fn refresh_ast_index(root: &Path, store: &mut StateStore) -> anyhow::Result<usiz
             .replace('\\', "/");
         existing.insert(rel.clone());
         let mtime = file_mtime_secs(&file);
-        if store.indexed_mtime(&rel) == Some(mtime) && mtime > 0 {
+        if store.indexed_mtime(&rel)? == Some(mtime) && mtime > 0 {
             continue;
         }
-        if let Ok(syms) = rust_ast::extract_file(root, &file) {
-            store.replace_file_symbols(&rel, mtime, &syms)?;
-            reindexed += 1;
+        match rust_ast::extract_file(root, &file) {
+            Ok(syms) => {
+                store.replace_file_symbols(&rel, mtime, &syms)?;
+                reindexed += 1;
+            }
+            Err(err) => {
+                eprintln!("vektor AST refresh skipped {rel}: {err}");
+            }
         }
     }
     store.prune_missing_ast_files(&existing)?;
@@ -147,7 +166,7 @@ impl ToolHandler for HealthTool {
                 "selectiveStopGate": true
             }
         });
-        ToolResult::ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
+        ok_json(&payload)
     }
 }
 
@@ -178,7 +197,7 @@ impl ToolHandler for WorkspaceInfoTool {
             return ToolResult::err(format!("Workspace path does not exist: {}", root.display()));
         }
         let summary = collect_workspace_summary(&root);
-        ToolResult::ok(serde_json::to_string_pretty(&summary).unwrap_or_default())
+        ok_json(&summary)
     }
 }
 
@@ -229,7 +248,7 @@ impl ToolHandler for TeamRosterTool {
                 }
             ]
         });
-        ToolResult::ok(serde_json::to_string_pretty(&roster).unwrap_or_default())
+        ok_json(&roster)
     }
 }
 
@@ -262,7 +281,7 @@ impl ToolHandler for CargoAuditDepsTool {
         let root = resolve_target_path(&args);
         let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(true);
         match cargo::analyze_workspace(&root, offline) {
-            Ok(report) => ToolResult::ok(serde_json::to_string_pretty(&report).unwrap_or_default()),
+            Ok(report) => ok_json(&report),
             Err(err) => ToolResult::err(format!("Cargo dependency audit failed: {err}")),
         }
     }
@@ -301,7 +320,7 @@ impl ToolHandler for ScanSecretsTool {
                     "findingCount": findings.len(),
                     "findings": findings
                 });
-                ToolResult::ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
+                ok_json(&payload)
             }
             Err(err) => ToolResult::err(format!("Secret scan failed: {err}")),
         }
@@ -341,7 +360,7 @@ impl ToolHandler for LintGhaTool {
                     "findingCount": findings.len(),
                     "findings": findings
                 });
-                ToolResult::ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
+                ok_json(&payload)
             }
             Err(err) => ToolResult::err(format!("GitHub Actions lint failed: {err}")),
         }
@@ -413,7 +432,7 @@ impl ToolHandler for RustAstQueryTool {
                     "symbolCount": symbols.len(),
                     "symbols": symbols
                 });
-                ToolResult::ok(serde_json::to_string_pretty(&payload).unwrap_or_default())
+                ok_json(&payload)
             }
             Err(err) => ToolResult::err(format!("AST query failed: {err}")),
         }
@@ -443,7 +462,7 @@ impl ToolHandler for RustApiDiffTool {
         let root = resolve_target_path(&args);
         let git_ref = args.get("gitRef").and_then(Value::as_str).unwrap_or("HEAD");
         match rust_ast::diff_workspace_against_git(&root, git_ref) {
-            Ok(report) => ToolResult::ok(serde_json::to_string_pretty(&report).unwrap_or_default()),
+            Ok(report) => ok_json(&report),
             Err(err) => ToolResult::err(format!("AST API diff failed: {err}")),
         }
     }
@@ -472,7 +491,7 @@ impl ToolHandler for SbomCycloneDxTool {
         let root = resolve_target_path(&args);
         let offline = args.get("offline").and_then(Value::as_bool).unwrap_or(true);
         match cargo::generate_cyclonedx_sbom(&root, offline) {
-            Ok(sbom) => ToolResult::ok(serde_json::to_string_pretty(&sbom).unwrap_or_default()),
+            Ok(sbom) => ok_json(&sbom),
             Err(err) => ToolResult::err(format!("CycloneDX SBOM generation failed: {err}")),
         }
     }
@@ -520,7 +539,7 @@ impl ToolHandler for SecuritySarifTool {
             &trojan_hits,
             &gha_hits,
         );
-        ToolResult::ok(serde_json::to_string_pretty(&report).unwrap_or_default())
+        ok_json(&report)
     }
 }
 
@@ -545,7 +564,7 @@ impl ToolHandler for RepoHygieneTool {
     fn call(&self, args: Value) -> ToolResult {
         let root = resolve_target_path(&args);
         match hygiene::audit_repo_hygiene(&root) {
-            Ok(report) => ToolResult::ok(serde_json::to_string_pretty(&report).unwrap_or_default()),
+            Ok(report) => ok_json(&report),
             Err(err) => ToolResult::err(format!("Repo hygiene audit failed: {err}")),
         }
     }
@@ -591,10 +610,7 @@ impl ToolHandler for SwarmTaskTool {
             "list" => {
                 let status = args.get("status").and_then(Value::as_str);
                 match store.list_tasks(status) {
-                    Ok(tasks) => ToolResult::ok(
-                        serde_json::to_string_pretty(&json!({ "tasks": tasks }))
-                            .unwrap_or_default(),
-                    ),
+                    Ok(tasks) => ok_json(&json!({ "tasks": tasks })),
                     Err(err) => ToolResult::err(format!("Failed to list tasks: {err}")),
                 }
             }
@@ -626,9 +642,7 @@ impl ToolHandler for SwarmTaskTool {
                     .unwrap_or_default();
 
                 match store.upsert_task(id, title, owner, status, &deps, notes) {
-                    Ok(task) => {
-                        ToolResult::ok(serde_json::to_string_pretty(&task).unwrap_or_default())
-                    }
+                    Ok(task) => ok_json(&task),
                     Err(err) => ToolResult::err(format!("Failed to upsert task: {err}")),
                 }
             }
@@ -652,8 +666,9 @@ impl ToolHandler for SwarmLockTool {
                     "action": { "type": "string", "enum": ["list", "acquire", "release"] },
                     "filePath": { "type": "string", "description": "Relative file path to lock/unlock." },
                     "ownerAgent": { "type": "string", "description": "Agent name acquiring or releasing the lock." },
+                    "force": { "type": "boolean", "description": "Required to release a lock without specifying ownerAgent." },
                     "reason": { "type": "string" },
-                    "ttlSecs": { "type": "integer", "description": "Lock TTL in seconds (default: 1800)." }
+                    "ttlSecs": { "type": "integer", "description": "Lock TTL in seconds (10..=86400, default: 1800)." }
                 },
                 "required": ["action"],
                 "additionalProperties": false
@@ -672,9 +687,7 @@ impl ToolHandler for SwarmLockTool {
 
         match action {
             "list" => match store.list_locks() {
-                Ok(locks) => ToolResult::ok(
-                    serde_json::to_string_pretty(&json!({ "locks": locks })).unwrap_or_default(),
-                ),
+                Ok(locks) => ok_json(&json!({ "locks": locks })),
                 Err(err) => ToolResult::err(format!("Failed to list locks: {err}")),
             },
             "acquire" => {
@@ -688,17 +701,11 @@ impl ToolHandler for SwarmLockTool {
                 let ttl = args.get("ttlSecs").and_then(Value::as_i64);
 
                 match store.acquire_lock(file_path, owner, reason, ttl) {
-                    Ok(Ok(lock)) => ToolResult::ok(
-                        serde_json::to_string_pretty(&json!({ "acquired": true, "lock": lock }))
-                            .unwrap_or_default(),
-                    ),
-                    Ok(Err(holder)) => ToolResult::err(
-                        serde_json::to_string_pretty(&json!({
-                            "acquired": false,
-                            "conflictWith": holder
-                        }))
-                        .unwrap_or_default(),
-                    ),
+                    Ok(Ok(lock)) => ok_json(&json!({ "acquired": true, "lock": lock })),
+                    Ok(Err(holder)) => err_json(&json!({
+                        "acquired": false,
+                        "conflictWith": holder
+                    })),
                     Err(err) => ToolResult::err(format!("Failed to acquire lock: {err}")),
                 }
             }
@@ -707,11 +714,14 @@ impl ToolHandler for SwarmLockTool {
                     return ToolResult::err("Missing required field `filePath`");
                 };
                 let owner = args.get("ownerAgent").and_then(Value::as_str);
+                let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+                if owner.is_none() && !force {
+                    return ToolResult::err(
+                        "Missing required field `ownerAgent` for release (or pass `force: true`)",
+                    );
+                }
                 match store.release_lock(file_path, owner) {
-                    Ok(released) => ToolResult::ok(
-                        serde_json::to_string_pretty(&json!({ "releasedCount": released }))
-                            .unwrap_or_default(),
-                    ),
+                    Ok(released) => ok_json(&json!({ "releasedCount": released })),
                     Err(err) => ToolResult::err(format!("Failed to release lock: {err}")),
                 }
             }

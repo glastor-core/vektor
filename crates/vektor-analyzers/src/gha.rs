@@ -21,6 +21,7 @@ pub struct GhaFinding {
     pub remediation: String,
 }
 
+#[allow(clippy::expect_used)]
 fn uses_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -28,19 +29,27 @@ fn uses_regex() -> &'static Regex {
     })
 }
 
+#[allow(clippy::expect_used)]
 fn untrusted_expr_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
-            r"\$\{\{\s*github\.event\.(?:issue\.title|issue\.body|pull_request\.title|pull_request\.body|pull_request\.head\.ref|comment\.body|review\.body|head_commit\.message)\b",
+            r"\$\{\{\s*(?:github\.head_ref\b|github\.event\.(?:issue\.title|issue\.body|pull_request\.title|pull_request\.body|pull_request\.head\.(?:ref|label|repo\.default_branch)|comment\.body|review\.body|head_commit\.message|discussion\.(?:title|body)|workflow_run\.head_branch)\b)",
         )
         .expect("valid regex")
     })
 }
 
+#[allow(clippy::expect_used)]
 fn sha40_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"^[0-9a-fA-F]{40}$").expect("valid regex"))
+}
+
+#[allow(clippy::expect_used)]
+fn sha256_digest_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"@sha256:[0-9a-fA-F]{64}$").expect("valid regex"))
 }
 
 /// Lint a GitHub Actions workflow YAML string with exact line numbers.
@@ -110,14 +119,17 @@ pub fn lint_workflow_content(file_label: &str, content: &str) -> Vec<GhaFinding>
             ));
         }
 
-        if uses_pr_target && trimmed.contains("github.event.pull_request.head") {
+        if uses_pr_target
+            && (trimmed.contains("github.event.pull_request.head")
+                || trimmed.contains("refs/pull/"))
+        {
             findings.push(make_finding(
                 "GHA-PR-TARGET-CHECKOUT",
                 Severity::Critical,
                 file_label,
                 line_no,
                 "Untrusted PR head referenced in a `pull_request_target` workflow (pwn-request risk)",
-                "Do not check out or execute code from `github.event.pull_request.head` under `pull_request_target`.",
+                "Do not check out or execute code from `github.event.pull_request.head` or `refs/pull/` under `pull_request_target`.",
             ));
         }
 
@@ -219,8 +231,24 @@ fn check_uses_pinning(
     sha_re: &Regex,
 ) -> Option<GhaFinding> {
     let action_ref = uses_re.captures(raw_line)?.get(1)?.as_str();
-    if action_ref.starts_with("./") || action_ref.starts_with("docker://") {
+    if action_ref.starts_with("./") {
         return None;
+    }
+    if action_ref.starts_with("docker://") {
+        if sha256_digest_regex().is_match(action_ref) {
+            return None;
+        }
+        return Some(GhaFinding {
+            rule_id: "GHA-UNPINNED-ACTION".to_string(),
+            severity: Severity::High,
+            file: file_label.to_string(),
+            line: line_no,
+            message: format!(
+                "Docker action `{action_ref}` is not pinned to an immutable `@sha256:<64-hex>` digest"
+            ),
+            remediation: "Pin Docker image references to an immutable `@sha256:` digest."
+                .to_string(),
+        });
     }
     let pinned = action_ref
         .split_once('@')
@@ -243,8 +271,14 @@ fn check_uses_pinning(
 
 /// Lint all `.yml`/`.yaml` files under `<workspace>/.github/workflows` or a single workflow file.
 pub fn lint_workspace_or_file(path: &Path) -> Result<Vec<GhaFinding>> {
-    if path.is_file() {
-        let content = std::fs::read_to_string(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Ok(Vec::new());
+    }
+    if meta.file_type().is_file() {
+        let Some(content) = crate::read_bounded_utf8(path, crate::MAX_SCAN_FILE_BYTES)? else {
+            return Ok(Vec::new());
+        };
         return Ok(lint_workflow_content(&path.display().to_string(), &content));
     }
 
@@ -257,7 +291,8 @@ pub fn lint_workspace_or_file(path: &Path) -> Result<Vec<GhaFinding>> {
     for entry in std::fs::read_dir(&workflows_dir)? {
         let entry = entry?;
         let file_path = entry.path();
-        if !file_path.is_file() {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() || !ft.is_file() {
             continue;
         }
         let is_yaml = file_path
@@ -266,7 +301,10 @@ pub fn lint_workspace_or_file(path: &Path) -> Result<Vec<GhaFinding>> {
         if !is_yaml {
             continue;
         }
-        let content = std::fs::read_to_string(&file_path)?;
+        let Some(content) = crate::read_bounded_utf8(&file_path, crate::MAX_SCAN_FILE_BYTES)?
+        else {
+            continue;
+        };
         let label = file_path
             .strip_prefix(path)
             .unwrap_or(&file_path)
