@@ -1,5 +1,6 @@
 mod cli_commands;
 mod hook_runner;
+mod mcp_resources;
 mod mcp_server;
 
 use std::io;

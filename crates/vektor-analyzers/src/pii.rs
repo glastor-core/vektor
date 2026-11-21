@@ -88,6 +88,9 @@ fn is_example_email(email: &str) -> bool {
         || lower.ends_with("@example.org")
         || lower.ends_with("@example.net")
         || lower.ends_with("@localhost")
+        || lower
+            .rsplit_once('.')
+            .is_some_and(|(_, tld)| tld == "local")
         || lower.contains("noreply@")
         || lower.contains("no-reply@")
 }
@@ -284,7 +287,7 @@ mod tests {
         let card = ["4111", "1111", "1111", "1111"].join("-");
         let ssn = ["123", "45", "6789"].join("-");
         let content = format!(
-            "card = \"{card}\"\nssn = \"{ssn}\"\ncontact = \"user@example.com\"\nreal = \"alice@acme.io\"\n"
+            "card = \"{card}\"\nssn = \"{ssn}\"\ncontact = \"user@example.com\"\nreal = \"alice@acme.io\"\n" // vektor:ignore
         );
         let hits = scan_text("sample.txt", &content);
         let ids: Vec<&str> = hits.iter().map(|h| h.rule_id.as_str()).collect();

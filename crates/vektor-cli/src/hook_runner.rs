@@ -7,7 +7,7 @@ use std::time::UNIX_EPOCH;
 use anyhow::Result;
 use serde_json::{json, Value};
 use vektor_analyzers::config::VektorConfig;
-use vektor_analyzers::{cargo, gha, rust_ast, secrets, trojan, Severity, MAX_SCAN_FILE_BYTES};
+use vektor_analyzers::{cargo, gha, pii, rust_ast, secrets, trojan, Severity, MAX_SCAN_FILE_BYTES};
 use vektor_core::hooks::{
     HookEvent, InvocationHookOutput, PostToolUseInput, PreToolUseInput, PreToolUseOutput,
     StopInput, StopOutput,
@@ -397,6 +397,14 @@ fn evaluate_file_mutation(
         }
     }
 
+    let pii_hits = pii::scan_text(label, text);
+    if let Some(high_pii) = pii_hits.iter().find(|f| f.severity >= Severity::High) {
+        return PreToolUseOutput::ask(format!(
+            "Vektor PII Guard [{}]: {} ({}) at line {}. Confirm before persisting PII.",
+            high_pii.rule_id, high_pii.message, high_pii.redacted_match, high_pii.line
+        ));
+    }
+
     PreToolUseOutput::allow()
 }
 
@@ -745,5 +753,42 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(evaluate_stop(&input).decision, "allow");
+    }
+
+    #[test]
+    fn asks_on_high_severity_pii_in_write_file() {
+        let card = ["4111", "1111", "1111", "1111"].join("-");
+        let input = PreToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "pii1".to_string(),
+                name: "write_file".to_string(),
+                args: json!({
+                    "Path": "customer.txt",
+                    "Content": format!("card = \"{card}\"\n")
+                }),
+            },
+            ..Default::default()
+        };
+        assert_eq!(evaluate_pre_tool_use(&input).decision, PreToolDecision::Ask);
+    }
+
+    #[test]
+    fn asks_on_high_severity_pii_in_write_file() {
+        let card = ["4111", "1111", "1111", "1111"].join("-");
+        let input = PreToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "pii1".to_string(),
+                name: "write_file".to_string(),
+                args: json!({
+                    "Path": "customer.txt",
+                    "Content": format!("card = \"{card}\"\n")
+                }),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_pre_tool_use(&input).decision,
+            PreToolDecision::Ask
+        );
     }
 }
