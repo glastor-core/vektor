@@ -3,6 +3,7 @@
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
 pub mod cargo;
+pub mod config;
 pub mod gha;
 pub mod hygiene;
 pub mod rust_ast;

@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "High-speed Rust MCP server, sub-millisecond Antigravity lifecycle hook engine, and DevSecOps CLI auditor"
+keywords = ["mcp", "devsecops", "sarif", "cli", "antigravity"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "vektor"
@@ -14,9 +20,17 @@ anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-vektor-analyzers = { path = "../vektor-analyzers" }
-vektor-core = { path = "../vektor-core" }
-vektor-state = { path = "../vektor-state" }
+vektor-analyzers.workspace = true
+vektor-core.workspace = true
+vektor-state.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/vektor-v{ version }-{ target }.{ archive-format }"
+bin-dir = "vektor-v{ version }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"

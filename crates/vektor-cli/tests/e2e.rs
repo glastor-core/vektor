@@ -280,3 +280,182 @@ fn e2e_audit_sarif_and_fail_on_threshold() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn e2e_mcp_modern_negotiation_annotations_and_resources() {
+    let mut child = Command::new(vektor_bin())
+        .arg("mcp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn vektor mcp");
+
+    {
+        let stdin = child.stdin.as_mut().expect("stdin");
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18"}}}}"#
+        )
+        .expect("write init");
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+        )
+        .expect("write tools/list");
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"resources/list","params":{{}}}}"#
+        )
+        .expect("write resources/list");
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{{"uri":"vektor://workspace/summary"}}}}"#
+        )
+        .expect("write resources/read");
+    }
+
+    let output = child.wait_with_output().expect("wait");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("utf8");
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 4);
+
+    let init: Value = serde_json::from_str(lines[0]).expect("init json");
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert!(init["result"]["capabilities"]["resources"].is_object());
+
+    let tools: Value = serde_json::from_str(lines[1]).expect("tools json");
+    let first_tool = &tools["result"]["tools"][0];
+    assert!(first_tool["annotations"]["readOnlyHint"].is_boolean());
+
+    let res_list: Value = serde_json::from_str(lines[2]).expect("resources/list json");
+    let resources = res_list["result"]["resources"]
+        .as_array()
+        .expect("resources array");
+    assert_eq!(resources.len(), 2);
+
+    let res_read: Value = serde_json::from_str(lines[3]).expect("resources/read json");
+    let text = res_read["result"]["contents"][0]["text"]
+        .as_str()
+        .expect("resource text");
+    assert!(text.contains("vektorVersion"));
+}
+
+#[test]
+fn e2e_init_doctor_and_audit_fix_workflow() {
+    let dir = std::env::temp_dir().join(format!("vektor-e2e-cli-full-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join(".github").join("workflows")).expect("mkdir");
+    std::fs::write(
+        dir.join(".github").join("workflows").join("ci.yml"),
+        "name: Unhardened\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    steps:\n      - run: echo ok\n",
+    )
+    .expect("write wf");
+
+    // 1. `vektor init` creates `vektor.toml`.
+    let init_out = Command::new(vektor_bin())
+        .args(["init", "--path"])
+        .arg(&dir)
+        .output()
+        .expect("run init");
+    assert!(init_out.status.success());
+    assert!(dir.join("vektor.toml").is_file());
+
+    // 2. `vektor doctor --format json` detects `vektor.toml`.
+    let doctor_out = Command::new(vektor_bin())
+        .args(["doctor", "--path"])
+        .arg(&dir)
+        .args(["--format", "json"])
+        .output()
+        .expect("run doctor");
+    assert!(doctor_out.status.success());
+    let doctor_json: Value = serde_json::from_slice(&doctor_out.stdout).expect("doctor json");
+    assert_eq!(doctor_json["vektorTomlLoaded"], true);
+    assert_eq!(doctor_json["stopGateMode"], "selective");
+
+    // 3. `vektor audit --fix` auto-remediates missing permissions & concurrency.
+    let fix_out = Command::new(vektor_bin())
+        .args(["audit", "--path"])
+        .arg(&dir)
+        .args(["--format", "json", "--fix", "--fail-on", "low"])
+        .output()
+        .expect("run audit --fix");
+    assert!(
+        fix_out.status.success(),
+        "expected audit --fix to remediate all findings, stderr: {}",
+        String::from_utf8_lossy(&fix_out.stderr)
+    );
+    let fix_json: Value = serde_json::from_slice(&fix_out.stdout).expect("fix json");
+    assert_eq!(fix_json["githubActions"].as_array().expect("gha").len(), 0);
+    assert_eq!(fix_json["appliedFixes"].as_array().expect("fixes").len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_stop_gate_respects_vektor_toml_off_mode() {
+    let dir = std::env::temp_dir().join(format!("vektor-e2e-stop-toml-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("write cargo.toml");
+    std::fs::write(dir.join("vektor.toml"), "[hooks]\nstop_gate = \"off\"\n")
+        .expect("write vektor.toml");
+    let lib_rs = dir.join("src/lib.rs");
+    std::fs::write(&lib_rs, "pub fn broken() -> i32 { \"bad\" }\n").expect("write broken");
+
+    let post_payload = json!({
+        "hookEventName": "PostToolUse",
+        "workspacePaths": [dir.display().to_string()],
+        "cwd": dir.display().to_string(),
+        "toolCall": { "id": "p1", "name": "write_file", "args": { "Path": lib_rs.display().to_string() } }
+    });
+    let mut post_child = Command::new(vektor_bin())
+        .args(["hook", "post-tool-use"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn post");
+    post_child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(post_payload.to_string().as_bytes())
+        .expect("write");
+    assert!(post_child
+        .wait_with_output()
+        .expect("wait")
+        .status
+        .success());
+
+    let stop_payload = json!({
+        "hookEventName": "Stop",
+        "terminationReason": "NO_TOOL_CALL",
+        "continuationActive": false,
+        "workspacePaths": [dir.display().to_string()],
+        "cwd": dir.display().to_string()
+    });
+    let mut stop_child = Command::new(vektor_bin())
+        .args(["hook", "stop"])
+        .env_remove("VEKTOR_STOP_GATE")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn stop");
+    stop_child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(stop_payload.to_string().as_bytes())
+        .expect("write");
+    let out = stop_child.wait_with_output().expect("wait");
+    assert!(out.status.success());
+    let json_out: Value = serde_json::from_slice(&out.stdout).expect("json");
+    assert_eq!(json_out["decision"], "allow");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

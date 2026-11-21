@@ -3,7 +3,10 @@ use std::time::UNIX_EPOCH;
 
 use serde_json::{json, Value};
 use vektor_analyzers::{cargo, gha, hygiene, rust_ast, sarif, secrets, trojan};
-use vektor_core::mcp::{McpServer, ToolDefinition, ToolHandler, ToolResult};
+use vektor_core::mcp::{
+    McpServer, ResourceDefinition, ResourceHandler, ToolAnnotations, ToolDefinition, ToolHandler,
+    ToolResult,
+};
 use vektor_state::StateStore;
 
 #[must_use]
@@ -22,6 +25,8 @@ pub(crate) fn build_server() -> McpServer {
     server.register(RepoHygieneTool);
     server.register(SwarmTaskTool);
     server.register(SwarmLockTool);
+    server.register_resource(WorkspaceSummaryResource);
+    server.register_resource(SwarmTasksResource);
     server
 }
 
@@ -659,6 +664,10 @@ impl ToolHandler for SwarmTaskTool {
             other => ToolResult::err(format!("Unsupported action: {other}")),
         }
     }
+
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        Some(ToolAnnotations::local_mutation())
+    }
 }
 
 struct SwarmLockTool;
@@ -737,5 +746,52 @@ impl ToolHandler for SwarmLockTool {
             }
             other => ToolResult::err(format!("Unsupported action: {other}")),
         }
+    }
+
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        Some(ToolAnnotations::local_mutation())
+    }
+}
+
+struct WorkspaceSummaryResource;
+
+impl ResourceHandler for WorkspaceSummaryResource {
+    fn definition(&self) -> ResourceDefinition {
+        ResourceDefinition {
+            uri: "vektor://workspace/summary".to_string(),
+            name: "Workspace Summary".to_string(),
+            description:
+                "Deterministic Cargo, Git, SQLite state, and GitHub Actions workspace inventory."
+                    .to_string(),
+            mime_type: "application/json".to_string(),
+        }
+    }
+
+    fn read(&self) -> anyhow::Result<String> {
+        let cwd = std::env::current_dir()?;
+        Ok(serde_json::to_string_pretty(&collect_workspace_summary(
+            &cwd,
+        ))?)
+    }
+}
+
+struct SwarmTasksResource;
+
+impl ResourceHandler for SwarmTasksResource {
+    fn definition(&self) -> ResourceDefinition {
+        ResourceDefinition {
+            uri: "vektor://swarm/tasks".to_string(),
+            name: "Swarm Task Blackboard".to_string(),
+            description: "Current tasks stored in the SQLite WAL Swarm Task Blackboard."
+                .to_string(),
+            mime_type: "application/json".to_string(),
+        }
+    }
+
+    fn read(&self) -> anyhow::Result<String> {
+        let cwd = std::env::current_dir()?;
+        let store = StateStore::open_workspace(&cwd)?;
+        let tasks = store.list_tasks(None)?;
+        Ok(serde_json::to_string_pretty(&json!({ "tasks": tasks }))?)
     }
 }

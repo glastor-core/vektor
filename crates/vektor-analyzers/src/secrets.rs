@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Command;
 use std::sync::OnceLock;
 
 use anyhow::Result;
 use regex::Regex;
 use serde::Serialize;
 
+use crate::config::VektorConfig;
 use crate::Severity;
 
 const SKIP_DIRS: &[&str] = &[
@@ -39,7 +41,7 @@ struct SecretRule {
     regex: Regex,
 }
 
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::too_many_lines)]
 fn compiled_rules() -> &'static [SecretRule] {
     static RULES: OnceLock<Vec<SecretRule>> = OnceLock::new();
     RULES.get_or_init(|| {
@@ -92,6 +94,68 @@ fn compiled_rules() -> &'static [SecretRule] {
                 message: "Stripe live secret key detected",
                 regex: Regex::new(r"\bsk_live_[0-9A-Za-z]{20,}\b").expect("valid regex"),
             },
+            SecretRule {
+                id: "SEC-NPM-TOKEN",
+                severity: Severity::Critical,
+                message: "npm access token detected",
+                regex: Regex::new(r"\bnpm_[A-Za-z0-9]{36}\b").expect("valid regex"),
+            },
+            SecretRule {
+                id: "SEC-PYPI-TOKEN",
+                severity: Severity::Critical,
+                message: "PyPI API token detected",
+                regex: Regex::new(r"\bpypi-AgEIcHlwaS5vcmc[A-Za-z0-9\-_]{50,}\b")
+                    .expect("valid regex"),
+            },
+            SecretRule {
+                id: "SEC-SENDGRID-KEY",
+                severity: Severity::High,
+                message: "SendGrid API key detected",
+                regex: Regex::new(r"\bSG\.[A-Za-z0-9\-_]{22}\.[A-Za-z0-9\-_]{43}\b")
+                    .expect("valid regex"),
+            },
+            SecretRule {
+                id: "SEC-TWILIO-KEY",
+                severity: Severity::High,
+                message: "Twilio API key detected",
+                regex: Regex::new(r"\bSK[0-9a-fA-F]{32}\b").expect("valid regex"),
+            },
+            SecretRule {
+                id: "SEC-TELEGRAM-BOT",
+                severity: Severity::High,
+                message: "Telegram bot token detected",
+                regex: Regex::new(r"\b[0-9]{8,10}:AA[A-Za-z0-9\-_]{33}\b").expect("valid regex"),
+            },
+            SecretRule {
+                id: "SEC-HUGGINGFACE-TOKEN",
+                severity: Severity::High,
+                message: "Hugging Face access token detected",
+                regex: Regex::new(r"\bhf_[A-Za-z0-9]{30,}\b").expect("valid regex"),
+            },
+            SecretRule {
+                id: "SEC-DB-URI",
+                severity: Severity::Critical,
+                message: "Database connection URI with embedded credentials detected",
+                regex: Regex::new(
+                    r#"\b(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^/\s:@]+:[^/\s@]{8,}@[^\s"']+"#,
+                )
+                .expect("valid regex"),
+            },
+            SecretRule {
+                id: "SEC-JWT-TOKEN",
+                severity: Severity::High,
+                message: "Hardcoded JSON Web Token (JWT) detected",
+                regex: Regex::new(
+                    r"\beyJ[A-Za-z0-9\-_]{10,}\.eyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{16,}\b",
+                )
+                .expect("valid regex"),
+            },
+            SecretRule {
+                id: "SEC-GCP-SERVICE-ACCOUNT",
+                severity: Severity::Critical,
+                message: "Google Cloud service account JSON key material detected",
+                regex: Regex::new(r#""type"\s*:\s*"service_account""#).expect("valid regex"),
+            },
         ]
     })
 }
@@ -122,6 +186,22 @@ pub fn scan_text_with_options(
     content: &str,
     allow_inline_ignore: bool,
 ) -> Vec<SecretFinding> {
+    scan_text_with_config(
+        source_label,
+        content,
+        allow_inline_ignore,
+        &VektorConfig::default(),
+    )
+}
+
+/// Scan raw text honoring `VektorConfig` (`entropy_threshold`, `disabled_rules`).
+#[must_use]
+pub fn scan_text_with_config(
+    source_label: &str,
+    content: &str,
+    allow_inline_ignore: bool,
+    cfg: &VektorConfig,
+) -> Vec<SecretFinding> {
     let mut findings = Vec::new();
     let rules = compiled_rules();
     let generic_re = generic_assignment_regex();
@@ -134,6 +214,9 @@ pub fn scan_text_with_options(
         let mut specific_spans: Vec<(usize, usize)> = Vec::new();
 
         for rule in rules {
+            if cfg.is_rule_disabled(rule.id) {
+                continue;
+            }
             for m in rule.regex.find_iter(line) {
                 specific_spans.push((m.start(), m.end()));
                 findings.push(SecretFinding {
@@ -147,6 +230,10 @@ pub fn scan_text_with_options(
             }
         }
 
+        if cfg.is_rule_disabled("SEC-HIGH-ENTROPY") {
+            continue;
+        }
+
         for caps in generic_re.captures_iter(line) {
             let Some(val) = caps.get(1).or_else(|| caps.get(2)) else {
                 continue;
@@ -158,7 +245,9 @@ pub fn scan_text_with_options(
                 continue;
             }
             let candidate = val.as_str();
-            if !looks_like_placeholder(candidate) && shannon_entropy(candidate) >= 3.5 {
+            if !looks_like_placeholder(candidate)
+                && shannon_entropy(candidate) >= cfg.entropy_threshold
+            {
                 findings.push(SecretFinding {
                     rule_id: "SEC-HIGH-ENTROPY".to_string(),
                     severity: Severity::High,
@@ -175,53 +264,45 @@ pub fn scan_text_with_options(
 }
 
 /// Recursively scan a file or directory for hardcoded secrets.
-/// Respects optional `.vektorignore` patterns at `target` root and skips symlinks.
+/// Respects `vektor.toml`, `.vektorignore`, and `.gitignore` patterns at `target` root and skips symlinks.
 pub fn scan_path(target: &Path) -> Result<Vec<SecretFinding>> {
-    let ignore_patterns = load_ignore_patterns(target);
+    let cfg = VektorConfig::load(target);
     let mut findings = Vec::new();
-    scan_recursive(target, target, 0, &ignore_patterns, &mut findings)?;
+    scan_recursive(target, target, 0, &cfg, &mut findings)?;
     Ok(findings)
 }
 
-fn load_ignore_patterns(root: &Path) -> Vec<String> {
-    let ignore_file = if root.is_dir() {
-        root.join(".vektorignore")
-    } else {
-        root.parent()
-            .map_or_else(|| root.join(".vektorignore"), |p| p.join(".vektorignore"))
-    };
-    let Ok(Some(content)) = crate::read_bounded_utf8(&ignore_file, 65_536) else {
-        return Vec::new();
-    };
-    content
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.replace('\\', "/").trim_start_matches("./").to_string())
-        .collect()
-}
+/// Scan only files currently staged in the Git index (`git diff --cached --name-only`).
+pub fn scan_git_staged(root: &Path) -> Result<Vec<SecretFinding>> {
+    let cfg = VektorConfig::load(root);
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git diff --cached failed: {}", stderr.trim());
+    }
 
-fn is_ignored(rel_path: &str, patterns: &[String]) -> bool {
-    let norm = rel_path.replace('\\', "/");
-    let file_name = Path::new(&norm)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(&norm);
-
-    patterns.iter().any(|pat| {
-        let trimmed = pat.trim_end_matches('/');
-        if trimmed.is_empty() {
-            return false;
+    let mut findings = Vec::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for rel in stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if cfg.is_path_ignored(rel) {
+            continue;
         }
-        norm == trimmed || norm.starts_with(&format!("{trimmed}/")) || file_name == trimmed
-    })
+        let full = root.join(rel);
+        if let Ok(Some(text)) = crate::read_bounded_utf8(&full, crate::MAX_SCAN_FILE_BYTES) {
+            findings.extend(scan_text_with_config(rel, &text, true, &cfg));
+        }
+    }
+    Ok(findings)
 }
 
 fn scan_recursive(
     root: &Path,
     current: &Path,
     depth: usize,
-    ignore_patterns: &[String],
+    cfg: &VektorConfig,
     findings: &mut Vec<SecretFinding>,
 ) -> Result<()> {
     if depth > crate::MAX_WALK_DEPTH {
@@ -229,7 +310,7 @@ fn scan_recursive(
     }
     if let Ok(rel_path) = current.strip_prefix(root) {
         let rel_str = rel_path.display().to_string().replace('\\', "/");
-        if !rel_str.is_empty() && is_ignored(&rel_str, ignore_patterns) {
+        if !rel_str.is_empty() && cfg.is_path_ignored(&rel_str) {
             return Ok(());
         }
     }
@@ -254,7 +335,7 @@ fn scan_recursive(
         } else {
             rel
         };
-        findings.extend(scan_text(&label, &text));
+        findings.extend(scan_text_with_config(&label, &text, true, cfg));
         return Ok(());
     }
 
@@ -273,7 +354,7 @@ fn scan_recursive(
                     }
                 }
             }
-            scan_recursive(root, &path, depth + 1, ignore_patterns, findings)?;
+            scan_recursive(root, &path, depth + 1, cfg, findings)?;
         }
     }
 

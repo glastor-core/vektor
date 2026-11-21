@@ -6,6 +6,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use serde_json::{json, Value};
+use vektor_analyzers::config::VektorConfig;
 use vektor_analyzers::{cargo, gha, rust_ast, secrets, trojan, Severity, MAX_SCAN_FILE_BYTES};
 use vektor_core::hooks::{
     HookEvent, InvocationHookOutput, PostToolUseInput, PreToolUseInput, PreToolUseOutput,
@@ -204,7 +205,11 @@ fn evaluate_stop(input: &StopInput) -> StopOutput {
         return StopOutput::allow_stop();
     }
 
-    if std::env::var("VEKTOR_STOP_GATE").is_ok_and(|v| v.eq_ignore_ascii_case("off") || v == "0") {
+    let env_gate = std::env::var("VEKTOR_STOP_GATE").ok();
+    if env_gate
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("off") || v == "0")
+    {
         return StopOutput::allow_stop();
     }
 
@@ -213,6 +218,21 @@ fn evaluate_stop(input: &StopInput) -> StopOutput {
         return StopOutput::allow_stop();
     };
     if !root.join("Cargo.toml").is_file() {
+        return StopOutput::allow_stop();
+    }
+
+    let gate_mode = env_gate.as_deref().map_or_else(
+        || VektorConfig::load(&root).stop_gate,
+        str::to_ascii_lowercase,
+    );
+    if gate_mode == "off" || gate_mode == "0" {
+        return StopOutput::allow_stop();
+    }
+
+    let gate_mode = env_gate
+        .as_deref()
+        .map_or_else(|| VektorConfig::load(&root).stop_gate, str::to_ascii_lowercase);
+    if gate_mode == "off" || gate_mode == "0" {
         return StopOutput::allow_stop();
     }
 
@@ -234,11 +254,15 @@ fn evaluate_stop(input: &StopInput) -> StopOutput {
         return StopOutput::allow_stop();
     }
 
-    let affected = match cargo::affected_workspace_crates(&root, &dirty, true) {
-        Ok(crates) => crates,
-        Err(err) => {
-            eprintln!("vektor Stop gate affected-crate solver fallback (--workspace): {err}");
-            Vec::new()
+    let affected = if gate_mode == "full" {
+        Vec::new()
+    } else {
+        match cargo::affected_workspace_crates(&root, &dirty, true) {
+            Ok(crates) => crates,
+            Err(err) => {
+                eprintln!("vektor Stop gate affected-crate solver fallback (--workspace): {err}");
+                Vec::new()
+            }
         }
     };
 

@@ -1,0 +1,20 @@
+# Vektor DevSecOps & Antigravity Hook Configuration
+# See: https://github.com/glastor-core/vektor
+
+[audit]
+respect_gitignore = true
+ignore_paths = [
+  "target/",
+  "node_modules/",
+  "dist/",
+  ".vektor/",
+]
+disabled_rules = []
+
+[secrets]
+# Minimum Shannon entropy (bits/char) for generic credential assignments (default: 3.5)
+entropy_threshold = 3.5
+
+[hooks]
+# Stop quality gate mode: "selective" | "full" | "off"
+stop_gate = "selective"

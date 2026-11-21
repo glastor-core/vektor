@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+/// Supported MCP protocol versions for `initialize` negotiation.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Maximum allowed JSON-RPC line frame size (16 MiB) to prevent memory exhaustion.
 pub const MAX_MCP_LINE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -75,17 +77,81 @@ impl ToolResult {
     }
 }
 
+/// Optional MCP Tool Annotations (`2025-03-26`+) guiding client auto-approval & safety UX.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ToolAnnotations {
+    pub read_only_hint: bool,
+    pub destructive_hint: bool,
+    pub idempotent_hint: bool,
+    pub open_world_hint: bool,
+}
+
+impl ToolAnnotations {
+    /// Preset for deterministic, local, read-only analysis tools.
+    #[must_use]
+    pub const fn read_only() -> Self {
+        Self {
+            read_only_hint: true,
+            destructive_hint: false,
+            idempotent_hint: true,
+            open_world_hint: false,
+        }
+    }
+
+    /// Preset for local state-mutating tools (e.g., Swarm blackboard/locks).
+    #[must_use]
+    pub const fn local_mutation() -> Self {
+        Self {
+            read_only_hint: false,
+            destructive_hint: false,
+            idempotent_hint: false,
+            open_world_hint: false,
+        }
+    }
+}
+
+/// Metadata describing an MCP resource exposed by the server.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceDefinition {
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime_type: String,
+}
+
+/// Trait implemented by every Vektor MCP resource.
+pub trait ResourceHandler: Send + Sync {
+    fn definition(&self) -> ResourceDefinition;
+    fn read(&self) -> Result<String>;
+}
+
 /// Trait implemented by every Vektor MCP tool.
 pub trait ToolHandler: Send + Sync {
     fn definition(&self) -> ToolDefinition;
     fn call(&self, args: Value) -> ToolResult;
+    /// Optional MCP tool annotations (defaults to read-only local analysis).
+    fn annotations(&self) -> Option<ToolAnnotations> {
+        Some(ToolAnnotations::read_only())
+    }
 }
 
-/// Registry and dispatcher for MCP tools.
+#[derive(Serialize)]
+struct ToolListEntry {
+    #[serde(flatten)]
+    definition: ToolDefinition,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<ToolAnnotations>,
+}
+
+/// Registry and dispatcher for MCP tools and resources.
 pub struct McpServer {
     name: String,
     version: String,
     tools: BTreeMap<String, Box<dyn ToolHandler>>,
+    resources: BTreeMap<String, Box<dyn ResourceHandler>>,
 }
 
 impl fmt::Debug for McpServer {
@@ -94,6 +160,7 @@ impl fmt::Debug for McpServer {
             .field("name", &self.name)
             .field("version", &self.version)
             .field("tools", &self.tools.keys().collect::<Vec<_>>())
+            .field("resources", &self.resources.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -105,12 +172,18 @@ impl McpServer {
             name: name.into(),
             version: version.into(),
             tools: BTreeMap::new(),
+            resources: BTreeMap::new(),
         }
     }
 
     pub fn register<T: ToolHandler + 'static>(&mut self, handler: T) {
         let def = handler.definition();
         self.tools.insert(def.name, Box::new(handler));
+    }
+
+    pub fn register_resource<R: ResourceHandler + 'static>(&mut self, handler: R) {
+        let def = handler.definition();
+        self.resources.insert(def.uri, Box::new(handler));
     }
 
     /// Process a single JSON-RPC line. Returns `None` for notifications.
@@ -135,21 +208,37 @@ impl McpServer {
         let id = req.id?;
 
         let response = match req.method.as_str() {
-            "initialize" => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(json!({
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {
-                        "tools": {}
-                    },
-                    "serverInfo": {
-                        "name": self.name,
-                        "version": self.version
-                    }
-                })),
-                error: None,
-            },
+            "initialize" => {
+                let negotiated = req
+                    .params
+                    .get("protocolVersion")
+                    .and_then(Value::as_str)
+                    .and_then(|v| {
+                        SUPPORTED_PROTOCOL_VERSIONS
+                            .iter()
+                            .copied()
+                            .find(|&supported| supported == v)
+                    })
+                    .unwrap_or(MCP_PROTOCOL_VERSION);
+                let capabilities = if self.resources.is_empty() {
+                    json!({ "tools": {} })
+                } else {
+                    json!({ "tools": {}, "resources": {} })
+                };
+                JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(json!({
+                        "protocolVersion": negotiated,
+                        "capabilities": capabilities,
+                        "serverInfo": {
+                            "name": self.name,
+                            "version": self.version
+                        }
+                    })),
+                    error: None,
+                }
+            }
             "ping" => JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -157,8 +246,14 @@ impl McpServer {
                 error: None,
             },
             "tools/list" => {
-                let defs: Vec<ToolDefinition> =
-                    self.tools.values().map(|t| t.definition()).collect();
+                let defs: Vec<ToolListEntry> = self
+                    .tools
+                    .values()
+                    .map(|t| ToolListEntry {
+                        definition: t.definition(),
+                        annotations: t.annotations(),
+                    })
+                    .collect();
                 JsonRpcResponse {
                     jsonrpc: "2.0",
                     id,
@@ -167,6 +262,17 @@ impl McpServer {
                 }
             }
             "tools/call" => self.handle_tool_call(id, &req.params),
+            "resources/list" => {
+                let defs: Vec<ResourceDefinition> =
+                    self.resources.values().map(|r| r.definition()).collect();
+                JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(json!({ "resources": defs })),
+                    error: None,
+                }
+            }
+            "resources/read" => self.handle_resource_read(id, &req.params),
             other => JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -179,6 +285,59 @@ impl McpServer {
         };
 
         Some(response)
+    }
+
+    fn handle_resource_read(&self, id: Value, params: &Value) -> JsonRpcResponse {
+        let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: "Missing required parameter: uri".to_string(),
+                }),
+            };
+        };
+
+        let Some(handler) = self.resources.get(uri) else {
+            return JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32602,
+                    message: format!("Unknown resource URI: {uri}"),
+                }),
+            };
+        };
+
+        let def = handler.definition();
+        match handler.read() {
+            Ok(text) => JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: Some(json!({
+                    "contents": [
+                        {
+                            "uri": def.uri,
+                            "mimeType": def.mime_type,
+                            "text": text
+                        }
+                    ]
+                })),
+                error: None,
+            },
+            Err(err) => JsonRpcResponse {
+                jsonrpc: "2.0",
+                id,
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32603,
+                    message: format!("Failed to read resource {uri}: {err}"),
+                }),
+            },
+        }
     }
 
     fn handle_tool_call(&self, id: Value, params: &Value) -> JsonRpcResponse {

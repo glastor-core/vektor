@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Pure-Rust deterministic DevSecOps analyzers for Vektor (secrets, Trojan Guard, GitHub Actions, Rust AST, SARIF, SBOM)"
+keywords = ["devsecops", "sarif", "sbom", "github-actions", "tree-sitter"]
+categories = ["development-tools", "parsing"]
 
 [dependencies]
 anyhow.workspace = true
