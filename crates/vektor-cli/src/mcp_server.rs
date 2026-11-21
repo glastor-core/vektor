@@ -245,6 +245,16 @@ impl ToolHandler for TeamRosterTool {
                     "agent": "github-maintainer",
                     "focus": "PR reviews, issues, Conventional Commits, changelogs, branch protection, release management",
                     "tools": ["vektor_workspace_info", "vektor_swarm_task"]
+                },
+                {
+                    "agent": "astro-expert",
+                    "focus": "High-conversion Astro landing pages, Islands architecture, Content Collections, SEO/OpenGraph/JSON-LD, Core Web Vitals, accessibility",
+                    "tools": ["vektor_workspace_info", "vektor_scan_secrets", "vektor_swarm_task", "vektor_swarm_lock"]
+                },
+                {
+                    "agent": "markdown-docs-expert",
+                    "focus": "Technical writing, Markdown documentation, READMEs, ADRs, Diataxis guides, API references, Mermaid diagrams, Starlight docs",
+                    "tools": ["vektor_workspace_info", "vektor_rust_ast_query", "vektor_repo_hygiene", "vektor_swarm_task", "vektor_swarm_lock"]
                 }
             ]
         });

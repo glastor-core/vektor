@@ -1,13 +1,13 @@
 # Vektor
 
-**Vektor** is a high-speed Rust MCP server, sub-5ms Antigravity lifecycle hook engine, and 5-expert development team plugin designed to complement **Gemini (Antigravity)** with **Engram** as the shared persistent memory backbone.
+**Vektor** is a high-speed Rust MCP server, sub-5ms Antigravity lifecycle hook engine, and 7-expert development team plugin designed to complement **Gemini (Antigravity)** with **Engram** as the shared persistent memory backbone.
 
 ## Architecture
 
 - **Gemini (Antigravity)**: Tech Lead / Orchestrator (`invoke_subagent`, `/swarm`).
 - **Engram**: Shared long-term persistent memory across all specialists.
 - **`plugin/`**: Native Antigravity Plugin bundling:
-  - `agents/`: 5 specialized subagents (`rust-expert`, `crates-specialist`, `security-auditor`, `gh-actions-engineer`, `github-maintainer`).
+  - `agents/`: 7 specialized subagents (`rust-expert`, `crates-specialist`, `security-auditor`, `gh-actions-engineer`, `github-maintainer`, `astro-expert`, `markdown-docs-expert`).
   - `skills/team-orchestration/SKILL.md`: Multi-expert orchestration playbook.
   - `rules/AGENTS.md`: Delegation matrix and Engram protocol.
   - `mcp_config.json` & `hooks.json`: Connects Antigravity to the `vektor` Rust binary.

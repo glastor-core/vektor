@@ -39,6 +39,11 @@ fn e2e_mcp_stdio_initialize_list_and_health() {
             r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"vektor_health","arguments":{{}}}}}}"#
         )
         .expect("write call");
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"vektor_team_roster","arguments":{{}}}}}}"#
+        )
+        .expect("write roster");
     }
 
     let output = child.wait_with_output().expect("wait vektor mcp");
@@ -52,8 +57,8 @@ fn e2e_mcp_stdio_initialize_list_and_health() {
     let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(
         lines.len(),
-        3,
-        "expected 3 responses (notification has none)"
+        4,
+        "expected 4 responses (notification has none)"
     );
 
     let init: Value = serde_json::from_str(lines[0]).expect("parse init");
@@ -69,6 +74,17 @@ fn e2e_mcp_stdio_initialize_list_and_health() {
         .as_str()
         .expect("health text");
     assert!(text.contains("\"status\": \"ok\""));
+
+    let roster: Value = serde_json::from_str(lines[3]).expect("parse roster");
+    assert_eq!(roster["result"]["isError"], false);
+    let roster_text = roster["result"]["content"][0]["text"]
+        .as_str()
+        .expect("roster text");
+    let roster_json: Value = serde_json::from_str(roster_text).expect("roster json");
+    let experts = roster_json["experts"].as_array().expect("experts array");
+    assert_eq!(experts.len(), 7);
+    assert!(roster_text.contains("astro-expert"));
+    assert!(roster_text.contains("markdown-docs-expert"));
 }
 
 #[test]

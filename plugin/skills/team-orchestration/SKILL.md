@@ -1,8 +1,8 @@
 ---
 name: team-orchestration
 description: >-
-  Orchestrate the Vektor 5-expert Rust/GitHub/Security dev team with Engram shared memory.
-  Use when a task spans multiple specialties (e.g., Rust implementation + crate selection + security audit + GitHub Actions CI/PR workflow).
+  Orchestrate the Vektor 7-expert Rust/GitHub/Security/Astro/Docs dev team with Engram shared memory.
+  Use when a task spans multiple specialties (e.g., Rust implementation + crate selection + security audit + GitHub Actions CI/PR workflow + Astro landing page + Markdown documentation).
 ---
 
 # Vektor Team Orchestration Playbook
@@ -12,7 +12,7 @@ Use this workflow when coordinating multiple Vektor specialists on a non-trivial
 ## 1. Load Shared Context from Engram
 
 Before spawning specialists:
-1. Query Engram (`mem_context`, then `mem_search` if needed) for prior architecture, crate, security, or CI decisions.
+1. Query Engram (`mem_context`, then `mem_search` if needed) for prior architecture, crate, security, CI, design, or documentation decisions.
 2. Call `vektor_workspace_info` to get deterministic workspace facts (Cargo manifests, Git state, GitHub Actions workflows).
 
 ## 2. Delegate in Parallel Where Independent
@@ -21,6 +21,7 @@ Launch only the specialists relevant to the task:
 - **New Rust feature / refactor**: `rust-expert` + `crates-specialist` (if adding/evaluating dependencies).
 - **Pre-merge / Release readiness**: `security-auditor` + `gh-actions-engineer` + `github-maintainer` in parallel.
 - **CI/CD or supply-chain hardening**: `gh-actions-engineer` + `security-auditor`.
+- **Product launch / Landing page & Docs**: `astro-expert` (Astro landing page) + `markdown-docs-expert` (README, guides, API reference, Starlight docs).
 
 Use Vektor's SQLite WAL coordination tools for parallel tracks:
 - Track work items and dependencies with `vektor_swarm_task` (`action: "upsert"` / `"list"`).
