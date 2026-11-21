@@ -7,7 +7,9 @@ use anyhow::Result;
 use clap::ValueEnum;
 use serde_json::json;
 use vektor_analyzers::config::VektorConfig;
-use vektor_analyzers::{cargo, gha, hygiene, pii, rust_ast, sarif, secrets, trojan, Severity};
+use vektor_analyzers::{
+    cargo, gha, hygiene, pii, rust_ast, sarif, secrets, trojan, web_ast, Severity,
+};
 use vektor_core::hooks::HookEvent;
 
 use crate::{hook_runner, mcp_server};
@@ -59,6 +61,7 @@ pub(crate) fn run_audit(
     fail_on: Option<FailSeverity>,
     staged: bool,
     fix: bool,
+    include_pii: bool,
 ) -> Result<ExitCode> {
     let root = resolve_root(path)?;
 
@@ -75,14 +78,20 @@ pub(crate) fn run_audit(
     };
     let trojan_hits = trojan::scan_path(&root)?;
     let gha_hits = gha::lint_workspace_or_file(&root)?;
+    let pii_hits = if include_pii {
+        pii::scan_path(&root)?
+    } else {
+        Vec::new()
+    };
 
     match format {
         AuditFormat::Sarif => {
-            let out = sarif::build_sarif_report(
+            let out = sarif::build_sarif_report_with_pii(
                 env!("CARGO_PKG_VERSION"),
                 &secret_hits,
                 &trojan_hits,
                 &gha_hits,
+                &pii_hits,
             );
             println!("{}", serde_json::to_string_pretty(&out)?);
         }
@@ -96,6 +105,9 @@ pub(crate) fn run_audit(
                 "githubActions": gha_hits,
                 "hygiene": hygiene_report
             });
+            if include_pii {
+                out["pii"] = json!(pii_hits);
+            }
             if fix {
                 out["appliedFixes"] = json!(fixes);
             }
@@ -109,6 +121,7 @@ pub(crate) fn run_audit(
                     &secret_hits,
                     &trojan_hits,
                     &gha_hits,
+                    &pii_hits,
                     &hygiene_report,
                     &fixes
                 )
@@ -122,6 +135,7 @@ pub(crate) fn run_audit(
                     &secret_hits,
                     &trojan_hits,
                     &gha_hits,
+                    &pii_hits,
                     &hygiene_report,
                     &fixes
                 )
@@ -138,7 +152,8 @@ pub(crate) fn run_audit(
                 .iter()
                 .filter(|f| f.severity >= threshold)
                 .count()
-            + gha_hits.iter().filter(|f| f.severity >= threshold).count();
+            + gha_hits.iter().filter(|f| f.severity >= threshold).count()
+            + pii_hits.iter().filter(|f| f.severity >= threshold).count();
 
         if failing_count > 0 {
             eprintln!(
@@ -148,6 +163,57 @@ pub(crate) fn run_audit(
         }
     }
 
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn run_web_ast(
+    path: Option<PathBuf>,
+    name: Option<&str>,
+    kind: Option<&str>,
+    exported: bool,
+    format: OutputFormat,
+) -> Result<ExitCode> {
+    let root = resolve_root(path)?;
+    let report = web_ast::scan_workspace(&root, name, kind, exported, 200)?;
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+        OutputFormat::Markdown => {
+            let mut out = format!(
+                "## Vektor TypeScript / Astro AST\n\n- **Files scanned**: {}\n- **Symbols matched**: {}\n- **Exported**: {}\n- **XSS/Exec Sinks**: {}\n",
+                report.file_count, report.symbol_count, report.exported_count, report.sink_count
+            );
+            if !report.symbols.is_empty() {
+                out.push_str("\n| File | Lang | Kind | Name | Exported | Lines |\n| :--- | :--- | :--- | :--- | :---: | :--- |\n");
+                for s in &report.symbols {
+                    let _ = writeln!(
+                        out,
+                        "| `{}` | `{}` | `{}` | `{}` | {} | {}-{} |",
+                        s.file,
+                        s.language,
+                        s.kind,
+                        s.name,
+                        if s.exported { "yes" } else { "no" },
+                        s.line_start,
+                        s.line_end
+                    );
+                }
+            }
+            print!("{out}");
+        }
+        OutputFormat::Pretty => {
+            println!(
+                "Vektor Web AST: {} file(s), {} symbol(s), {} exported, {} sink(s)",
+                report.file_count, report.symbol_count, report.exported_count, report.sink_count
+            );
+            for s in &report.symbols {
+                let exp = if s.exported { "export " } else { "" };
+                println!(
+                    "  [{}:{}] {}{} {} ({}:{}-{})",
+                    s.language, s.kind, exp, s.name, s.file, s.file, s.line_start, s.line_end
+                );
+            }
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -577,16 +643,18 @@ fn render_audit_markdown(
     secrets: &[secrets::SecretFinding],
     trojans: &[trojan::TrojanFinding],
     gha_hits: &[gha::GhaFinding],
+    pii_hits: &[pii::PiiFinding],
     hygiene: &hygiene::RepoHygieneReport,
     fixes: &[gha::GhaFixResult],
 ) -> String {
-    let total = secrets.len() + trojans.len() + gha_hits.len();
+    let total = secrets.len() + trojans.len() + gha_hits.len() + pii_hits.len();
     let status = if total == 0 { "PASS" } else { "FINDINGS" };
     let mut out = format!(
-        "## Vektor DevSecOps Audit — {status}\n\n| Scanner | Findings |\n| :--- | ---: |\n| Secrets | {} |\n| Trojan Guard (Unicode BiDi) | {} |\n| GitHub Actions Hardening | {} |\n| Repository Hygiene Score | **{}/100** ({}/{}) |\n",
+        "## Vektor DevSecOps Audit — {status}\n\n| Scanner | Findings |\n| :--- | ---: |\n| Secrets | {} |\n| Trojan Guard (Unicode BiDi) | {} |\n| GitHub Actions Hardening | {} |\n| PII Guard | {} |\n| Repository Hygiene Score | **{}/100** ({}/{}) |\n",
         secrets.len(),
         trojans.len(),
         gha_hits.len(),
+        pii_hits.len(),
         hygiene.score,
         hygiene.passed_count,
         hygiene.total_checks
@@ -620,6 +688,13 @@ fn render_audit_markdown(
                 g.severity, g.rule_id, g.file, g.line, g.message
             );
         }
+        for p in pii_hits {
+            let _ = writeln!(
+                out,
+                "- `[{:?}]` `{}` `{}:{}` — {} ({})",
+                p.severity, p.rule_id, p.file, p.line, p.message, p.redacted_match
+            );
+        }
     }
     out
 }
@@ -628,17 +703,19 @@ fn render_audit_pretty(
     secrets: &[secrets::SecretFinding],
     trojans: &[trojan::TrojanFinding],
     gha_hits: &[gha::GhaFinding],
+    pii_hits: &[pii::PiiFinding],
     hygiene: &hygiene::RepoHygieneReport,
     fixes: &[gha::GhaFixResult],
 ) -> String {
     let mut out = format!(
-        "Vektor DevSecOps Audit | Hygiene: {}/100 ({}/{}) | Secrets: {} | Trojans: {} | GHA: {}\n",
+        "Vektor DevSecOps Audit | Hygiene: {}/100 ({}/{}) | Secrets: {} | Trojans: {} | GHA: {} | PII: {}\n",
         hygiene.score,
         hygiene.passed_count,
         hygiene.total_checks,
         secrets.len(),
         trojans.len(),
-        gha_hits.len()
+        gha_hits.len(),
+        pii_hits.len()
     );
     for f in fixes {
         let _ = writeln!(out, "  [FIXED] {}: {}", f.file, f.applied_fixes.join("; "));
@@ -662,6 +739,13 @@ fn render_audit_pretty(
             out,
             "  [{:?}] {} {}:{} — {}",
             g.severity, g.rule_id, g.file, g.line, g.message
+        );
+    }
+    for p in pii_hits {
+        let _ = writeln!(
+            out,
+            "  [{:?}] {} {}:{} — {} ({})",
+            p.severity, p.rule_id, p.file, p.line, p.message, p.redacted_match
         );
     }
     out

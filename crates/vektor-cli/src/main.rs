@@ -1,5 +1,6 @@
 mod cli_commands;
 mod hook_runner;
+mod hook_shell;
 mod mcp_resources;
 mod mcp_server;
 
@@ -53,6 +54,9 @@ enum Commands {
         /// Deterministically auto-fix missing top-level GitHub Actions hardening blocks.
         #[arg(long)]
         fix: bool,
+        /// Include PII Guard findings (credit cards, SSNs, IBANs, emails) in the audit & SARIF report.
+        #[arg(long)]
+        include_pii: bool,
     },
     /// Run sub-millisecond PII Guard (credit cards, US SSNs, IBANs, personal emails).
     Pii {
@@ -65,6 +69,24 @@ enum Commands {
         /// Exit with non-zero status if any finding meets or exceeds this severity.
         #[arg(long, value_enum)]
         fail_on: Option<FailSeverity>,
+    },
+    /// Query `tree-sitter-typescript` AST symbols and XSS/eval sinks across `.ts`, `.tsx`, and `.astro` files.
+    WebAst {
+        /// Target workspace directory.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Optional substring filter on symbol name.
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional exact filter on symbol kind (`function`, `class`, `interface`, `type`, `const`, `xss_sink`, `code_exec_sink`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Return only exported symbols.
+        #[arg(long)]
+        exported: bool,
+        /// Output format (`json`, `markdown`, or `pretty`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+        format: OutputFormat,
     },
     /// Generate a `CycloneDX` 1.5 JSON SBOM from `cargo metadata`.
     Sbom {
@@ -193,12 +215,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
             fail_on,
             staged,
             fix,
-        } => cli_commands::run_audit(path, format, fail_on, staged, fix),
+            include_pii,
+        } => cli_commands::run_audit(path, format, fail_on, staged, fix, include_pii),
         Commands::Pii {
             path,
             format,
             fail_on,
         } => cli_commands::run_pii(path, format, fail_on),
+        Commands::WebAst {
+            path,
+            name,
+            kind,
+            exported,
+            format,
+        } => cli_commands::run_web_ast(path, name.as_deref(), kind.as_deref(), exported, format),
         Commands::Sbom { path, offline } => cli_commands::run_sbom(path, offline),
         Commands::ApiDiff {
             path,

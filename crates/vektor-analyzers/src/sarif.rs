@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 
 use crate::gha::GhaFinding;
+use crate::pii::PiiFinding;
 use crate::secrets::SecretFinding;
 use crate::trojan::TrojanFinding;
 use crate::Severity;
@@ -26,6 +27,18 @@ pub fn build_sarif_report(
     secrets: &[SecretFinding],
     trojans: &[TrojanFinding],
     gha: &[GhaFinding],
+) -> Value {
+    build_sarif_report_with_pii(tool_version, secrets, trojans, gha, &[])
+}
+
+/// Build a SARIF 2.1.0 JSON document including optional PII Guard findings.
+#[must_use]
+pub fn build_sarif_report_with_pii(
+    tool_version: &str,
+    secrets: &[SecretFinding],
+    trojans: &[TrojanFinding],
+    gha: &[GhaFinding],
+    pii: &[PiiFinding],
 ) -> Value {
     let mut results = Vec::new();
 
@@ -80,6 +93,22 @@ pub fn build_sarif_report(
         }));
     }
 
+    for f in pii {
+        results.push(json!({
+            "ruleId": f.rule_id,
+            "level": sarif_level(f.severity),
+            "message": {
+                "text": format!("{} ({})", f.message, f.redacted_match)
+            },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": normalize_uri(&f.file) },
+                    "region": { "startLine": f.line.max(1) }
+                }
+            }]
+        }));
+    }
+
     json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
@@ -88,7 +117,7 @@ pub fn build_sarif_report(
                 "driver": {
                     "name": "Vektor",
                     "version": tool_version,
-                    "informationUri": "https://github.com/ricsg/vektor"
+                    "informationUri": "https://github.com/glastor-core/vektor"
                 }
             },
             "results": results

@@ -132,6 +132,7 @@ stop_gate = "selective" # "selective" | "full" | "off"
 | `vektor_scan_pii` | Sub-ms PII Guard (Luhn cards, SSN, IBAN, emails) | `readOnly`, `idempotent` |
 | `vektor_lint_gha` | GitHub Actions SHA pinning, permissions, injection, timeouts | `readOnly`, `idempotent` |
 | `vektor_rust_ast_query` | Incremental `tree-sitter-rust` symbol & `unsafe` index | `readOnly`, `idempotent` |
+| `vektor_web_ast_query` | `tree-sitter-typescript` AST & XSS/eval sink scanner (`.ts`, `.tsx`, `.astro`) | `readOnly`, `idempotent` |
 | `vektor_rust_api_diff` | AST SemVer public API breaking-change diff vs Git | `readOnly`, `idempotent` |
 | `vektor_sbom_cyclonedx` | CycloneDX 1.5 JSON SBOM generator | `readOnly`, `idempotent` |
 | `vektor_security_sarif` | Combined Secrets + Trojan Guard + GHA SARIF 2.1.0 | `readOnly`, `idempotent` |

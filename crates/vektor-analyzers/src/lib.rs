@@ -11,6 +11,7 @@ pub mod rust_ast;
 pub mod sarif;
 pub mod secrets;
 pub mod trojan;
+pub mod web_ast;
 
 use std::fs::File;
 use std::io::Read;

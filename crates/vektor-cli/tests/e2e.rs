@@ -66,7 +66,7 @@ fn e2e_mcp_stdio_initialize_list_and_health() {
 
     let list: Value = serde_json::from_str(lines[1]).expect("parse list");
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 15);
 
     let health: Value = serde_json::from_str(lines[2]).expect("parse health");
     assert_eq!(health["result"]["isError"], false);
@@ -456,6 +456,48 @@ fn e2e_stop_gate_respects_vektor_toml_off_mode() {
     assert!(out.status.success());
     let json_out: Value = serde_json::from_slice(&out.stdout).expect("json");
     assert_eq!(json_out["decision"], "allow");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn e2e_audit_include_pii_sarif_and_web_ast_astro_tsx() {
+    let dir = std::env::temp_dir().join(format!("vektor-e2e-pii-web-ast-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("src")).expect("mkdir");
+
+    let card = ["4111", "1111", "1111", "1111"].join("-");
+    std::fs::write(dir.join("src/data.txt"), format!("card={card}\n")).expect("write pii");
+    std::fs::write(
+        dir.join("src/Page.astro"),
+        "---\nexport interface Props { title: string }\nexport function greet() { return 'hi'; }\n---\n<div set:html={title} />\n",
+    )
+    .expect("write astro");
+
+    // 1. `vektor audit --format sarif --include-pii --fail-on high` catches PII in SARIF.
+    let sarif_out = Command::new(vektor_bin())
+        .args(["audit", "--path"])
+        .arg(&dir)
+        .args(["--format", "sarif", "--include-pii", "--fail-on", "high"])
+        .output()
+        .expect("run audit --include-pii");
+    assert!(!sarif_out.status.success());
+    let sarif: Value = serde_json::from_slice(&sarif_out.stdout).expect("sarif json");
+    let results = sarif["runs"][0]["results"].as_array().expect("results");
+    assert!(results.iter().any(|r| r["ruleId"] == "PII-CREDIT-CARD"));
+
+    // 2. `vektor web-ast --format json` parses `.astro` frontmatter + `set:html` sink.
+    let web_out = Command::new(vektor_bin())
+        .args(["web-ast", "--path"])
+        .arg(&dir)
+        .args(["--format", "json"])
+        .output()
+        .expect("run web-ast");
+    assert!(web_out.status.success());
+    let web_json: Value = serde_json::from_slice(&web_out.stdout).expect("web json");
+    assert_eq!(web_json["fileCount"], 1);
+    assert_eq!(web_json["sinkCount"], 1);
+    assert_eq!(web_json["exportedCount"], 2);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

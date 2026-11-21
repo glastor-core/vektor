@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde_json::{json, Value};
-use vektor_analyzers::{cargo, gha, hygiene, pii, rust_ast, sarif, secrets, trojan};
+use vektor_analyzers::{cargo, gha, hygiene, pii, rust_ast, sarif, secrets, trojan, web_ast};
 use vektor_core::mcp::{McpServer, ToolAnnotations, ToolDefinition, ToolHandler, ToolResult};
 use vektor_state::StateStore;
 
@@ -19,6 +19,7 @@ pub(crate) fn build_server() -> McpServer {
     server.register(ScanPiiTool);
     server.register(LintGhaTool);
     server.register(RustAstQueryTool);
+    server.register(WebAstQueryTool);
     server.register(RustApiDiffTool);
     server.register(SbomCycloneDxTool);
     server.register(SecuritySarifTool);
@@ -523,7 +524,8 @@ impl ToolHandler for SecuritySarifTool {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace root to scan. Defaults to cwd." }
+                    "path": { "type": "string", "description": "Workspace root to scan. Defaults to cwd." },
+                    "includePii": { "type": "boolean", "description": "Include PII Guard findings in SARIF output (default: false)." }
                 },
                 "additionalProperties": false
             }),
@@ -535,6 +537,10 @@ impl ToolHandler for SecuritySarifTool {
         if !root.exists() {
             return ToolResult::err(format!("Target path does not exist: {}", root.display()));
         }
+        let include_pii = args
+            .get("includePii")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let secret_hits = match secrets::scan_path(&root) {
             Ok(h) => h,
             Err(err) => return ToolResult::err(format!("Secret scan failed: {err}")),
@@ -547,12 +553,21 @@ impl ToolHandler for SecuritySarifTool {
             Ok(h) => h,
             Err(err) => return ToolResult::err(format!("GHA lint failed: {err}")),
         };
+        let pii_hits = if include_pii {
+            match pii::scan_path(&root) {
+                Ok(h) => h,
+                Err(err) => return ToolResult::err(format!("PII scan failed: {err}")),
+            }
+        } else {
+            Vec::new()
+        };
 
-        let report = sarif::build_sarif_report(
+        let report = sarif::build_sarif_report_with_pii(
             env!("CARGO_PKG_VERSION"),
             &secret_hits,
             &trojan_hits,
             &gha_hits,
+            &pii_hits,
         );
         ok_json(&report)
     }
@@ -779,6 +794,48 @@ impl ToolHandler for ScanPiiTool {
                 "findings": findings
             })),
             Err(err) => ToolResult::err(format!("PII scan failed: {err}")),
+        }
+    }
+}
+
+struct WebAstQueryTool;
+
+impl ToolHandler for WebAstQueryTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "vektor_web_ast_query".to_string(),
+            description: "Query TypeScript (.ts/.tsx) and Astro (.astro) AST symbols and XSS/eval sinks powered by tree-sitter-typescript.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace root. Defaults to cwd." },
+                    "name": { "type": "string", "description": "Optional substring filter on symbol name." },
+                    "kind": { "type": "string", "description": "Optional kind filter (function, class, interface, type, const, xss_sink, code_exec_sink)." },
+                    "exportedOnly": { "type": "boolean", "description": "Return only exported symbols (default: false)." },
+                    "limit": { "type": "integer", "description": "Maximum results (default: 100)." }
+                },
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn call(&self, args: Value) -> ToolResult {
+        let root = resolve_target_path(&args);
+        let name = args.get("name").and_then(Value::as_str);
+        let kind = args.get("kind").and_then(Value::as_str);
+        let exported_only = args
+            .get("exportedOnly")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        #[allow(clippy::cast_possible_truncation)]
+        let limit = args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(100, |v| v as usize);
+
+        match web_ast::scan_workspace(&root, name, kind, exported_only, limit) {
+            Ok(report) => ok_json(&report),
+            Err(err) => ToolResult::err(format!("Web AST scan failed: {err}")),
         }
     }
 }
