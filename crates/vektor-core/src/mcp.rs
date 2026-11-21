@@ -603,4 +603,55 @@ mod tests {
         assert_eq!(second["id"], 12);
         assert!(second.get("error").is_none());
     }
+
+    struct DemoResource;
+    impl ResourceHandler for DemoResource {
+        fn definition(&self) -> ResourceDefinition {
+            ResourceDefinition {
+                uri: "vektor://demo".to_string(),
+                name: "Demo".to_string(),
+                description: "Demo resource".to_string(),
+                mime_type: "text/plain".to_string(),
+            }
+        }
+        fn read(&self) -> Result<String> {
+            Ok("hello-resource".to_string())
+        }
+    }
+
+    #[test]
+    fn negotiates_protocol_version_and_serves_resources() {
+        let mut server = McpServer::new("vektor-test", "0.1.0");
+        server.register(EchoTool);
+        server.register_resource(DemoResource);
+
+        let init = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#,
+            )
+            .expect("init");
+        assert_eq!(init.result.unwrap()["protocolVersion"], "2025-06-18");
+
+        let list = server
+            .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"resources/list"}"#)
+            .expect("list");
+        assert_eq!(list.result.unwrap()["resources"][0]["uri"], "vektor://demo");
+
+        let read = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":3,"method":"resources/read","params":{"uri":"vektor://demo"}}"#,
+            )
+            .expect("read");
+        assert_eq!(
+            read.result.unwrap()["contents"][0]["text"],
+            "hello-resource"
+        );
+
+        let missing = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"vektor://nope"}}"#,
+            )
+            .expect("missing");
+        assert_eq!(missing.error.unwrap().code, -32602);
+    }
 }

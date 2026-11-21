@@ -85,10 +85,14 @@ Vektor works both as an Antigravity MCP/hook engine **and** as a standalone DevS
 ```bash
 # Full DevSecOps audit (formats: pretty | markdown | json | sarif)
 vektor audit --format pretty
-vektor audit --format sarif --fail-on high > vektor.sarif
+vektor audit --format sarif --include-pii --fail-on high > vektor.sarif
 vektor audit --format markdown --fail-on low      # Ideal for GitHub PR comments
 vektor audit --staged --fail-on high              # Fast Git pre-commit secret check
 vektor audit --fix                                # Auto-harden missing GHA permissions/concurrency
+
+# PII Guard & TypeScript/Astro AST
+vektor pii --format pretty --fail-on high         # Credit cards (Luhn), SSN, IBAN, emails
+vektor web-ast --exported --format markdown       # .ts / .tsx / .astro AST + XSS/eval sinks
 
 # Supply-chain & Rust analysis
 vektor sbom --offline > sbom.cdx.json             # CycloneDX 1.5 SBOM
@@ -170,6 +174,7 @@ Vektor integrates directly with sibling tools from **[glastor-core](https://gith
 
 ## Contributing & Security
 
+- See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for architecture, module map, and threat model.
 - See [CONTRIBUTING.md](CONTRIBUTING.md) for local verification gates and coding standards.
 - See [CHANGELOG.md](CHANGELOG.md) for release history.
 - See [SECURITY.md](SECURITY.md) for responsible vulnerability disclosure.

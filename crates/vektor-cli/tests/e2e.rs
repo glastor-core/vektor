@@ -501,3 +501,62 @@ fn e2e_audit_include_pii_sarif_and_web_ast_astro_tsx() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn e2e_cli_sbom_deps_hygiene_pii_and_bench_smoke() {
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root");
+
+    // 1. `vektor sbom --offline` outputs valid CycloneDX 1.5 JSON.
+    let sbom = Command::new(vektor_bin())
+        .args(["sbom", "--path"])
+        .arg(workspace_root)
+        .arg("--offline")
+        .output()
+        .expect("run sbom");
+    assert!(sbom.status.success(), "sbom failed");
+    let sbom_json: Value = serde_json::from_slice(&sbom.stdout).expect("sbom json");
+    assert_eq!(sbom_json["bomFormat"], "CycloneDX");
+    assert_eq!(sbom_json["specVersion"], "1.5");
+
+    // 2. `vektor deps --offline --format markdown` succeeds.
+    let deps = Command::new(vektor_bin())
+        .args(["deps", "--path"])
+        .arg(workspace_root)
+        .args(["--offline", "--format", "markdown"])
+        .output()
+        .expect("run deps");
+    assert!(deps.status.success(), "deps failed");
+    assert!(String::from_utf8_lossy(&deps.stdout).contains("Vektor Cargo Dependency Audit"));
+
+    // 3. `vektor hygiene --min-score 100` passes on our own repo.
+    let hygiene = Command::new(vektor_bin())
+        .args(["hygiene", "--path"])
+        .arg(workspace_root)
+        .args(["--min-score", "100", "--format", "pretty"])
+        .output()
+        .expect("run hygiene");
+    assert!(hygiene.status.success(), "hygiene failed");
+
+    // 4. `vektor pii --fail-on low` passes with 0 findings on our own repo.
+    let pii = Command::new(vektor_bin())
+        .args(["pii", "--path"])
+        .arg(workspace_root)
+        .args(["--fail-on", "low", "--format", "json"])
+        .output()
+        .expect("run pii");
+    assert!(pii.status.success(), "pii failed");
+    let pii_json: Value = serde_json::from_slice(&pii.stdout).expect("pii json");
+    assert_eq!(pii_json["findingCount"], 0);
+
+    // 5. `vektor bench --iterations 10` succeeds.
+    let bench = Command::new(vektor_bin())
+        .args(["bench", "--iterations", "10"])
+        .output()
+        .expect("run bench");
+    assert!(bench.status.success(), "bench failed");
+    assert!(String::from_utf8_lossy(&bench.stdout).contains("PreToolUse hook"));
+}
