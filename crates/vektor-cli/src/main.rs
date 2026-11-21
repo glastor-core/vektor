@@ -53,6 +53,18 @@ enum Commands {
         #[arg(long)]
         fix: bool,
     },
+    /// Run sub-millisecond PII Guard (credit cards, US SSNs, IBANs, personal emails).
+    Pii {
+        /// Target file or directory (defaults to current working directory).
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Output format (`json`, `markdown`, or `pretty`).
+        #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
+        format: OutputFormat,
+        /// Exit with non-zero status if any finding meets or exceeds this severity.
+        #[arg(long, value_enum)]
+        fail_on: Option<FailSeverity>,
+    },
     /// Generate a `CycloneDX` 1.5 JSON SBOM from `cargo metadata`.
     Sbom {
         /// Target Rust workspace directory.
@@ -181,6 +193,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             staged,
             fix,
         } => cli_commands::run_audit(path, format, fail_on, staged, fix),
+        Commands::Pii {
+            path,
+            format,
+            fail_on,
+        } => cli_commands::run_pii(path, format, fail_on),
         Commands::Sbom { path, offline } => cli_commands::run_sbom(path, offline),
         Commands::ApiDiff {
             path,

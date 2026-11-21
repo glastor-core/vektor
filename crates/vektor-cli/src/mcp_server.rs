@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use serde_json::{json, Value};
-use vektor_analyzers::{cargo, gha, hygiene, rust_ast, sarif, secrets, trojan};
+use vektor_analyzers::{cargo, gha, hygiene, pii, rust_ast, sarif, secrets, trojan};
 use vektor_core::mcp::{
     McpServer, ResourceDefinition, ResourceHandler, ToolAnnotations, ToolDefinition, ToolHandler,
     ToolResult,
@@ -17,6 +17,7 @@ pub(crate) fn build_server() -> McpServer {
     server.register(TeamRosterTool);
     server.register(CargoAuditDepsTool);
     server.register(ScanSecretsTool);
+    server.register(ScanPiiTool);
     server.register(LintGhaTool);
     server.register(RustAstQueryTool);
     server.register(RustApiDiffTool);
@@ -750,6 +751,36 @@ impl ToolHandler for SwarmLockTool {
 
     fn annotations(&self) -> Option<ToolAnnotations> {
         Some(ToolAnnotations::local_mutation())
+    }
+}
+
+struct ScanPiiTool;
+
+impl ToolHandler for ScanPiiTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "vektor_scan_pii".to_string(),
+            description: "Sub-millisecond PII Guard (inspired by glastor-core/pii-veil): detects Luhn-valid payment cards, US SSNs, IBANs, and personal email addresses.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File or directory to scan. Defaults to cwd." }
+                },
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn call(&self, args: Value) -> ToolResult {
+        let target = resolve_target_path(&args);
+        match pii::scan_path(&target) {
+            Ok(findings) => ok_json(&json!({
+                "target": target.display().to_string(),
+                "findingCount": findings.len(),
+                "findings": findings
+            })),
+            Err(err) => ToolResult::err(format!("PII scan failed: {err}")),
+        }
     }
 }
 

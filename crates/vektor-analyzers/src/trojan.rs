@@ -189,13 +189,18 @@ mod tests {
     #[test]
     fn allows_clean_ascii_and_spanish_utf8() {
         let clean = "// Código limpio en español: ñ, á, é, í, ó, ú\nfn main() {}\n";
-        assert!(scan_text("src/main.rs", clean).is_empty());
+        let hits = scan_text("src/main.rs", clean);
+        assert!(hits.is_empty(), "expected clean text, got: {hits:?}");
     }
 
     #[test]
     fn detects_unicode_tags_line_sep_ansi_and_mid_bom() {
         let with_leading_bom = "\u{FEFF}fn ok() {}";
-        assert!(scan_text("src/lib.rs", with_leading_bom).is_empty());
+        let bom_hits = scan_text("src/lib.rs", with_leading_bom);
+        assert!(
+            bom_hits.is_empty(),
+            "expected leading BOM allowed, got: {bom_hits:?}"
+        );
         assert_eq!(
             scan_text_with_options("edit_fragment", with_leading_bom, false).len(),
             1

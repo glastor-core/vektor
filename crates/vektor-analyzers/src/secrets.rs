@@ -422,7 +422,7 @@ mod tests {
     fn ignores_obvious_placeholders() {
         let content = r#"api_key = "your_example_placeholder_key_here""#;
         let findings = scan_text("config.toml", content);
-        assert!(findings.is_empty());
+        assert!(findings.is_empty(), "expected empty, got: {findings:?}");
     }
 
     #[test]
@@ -438,7 +438,8 @@ mod tests {
     fn respects_inline_vektor_ignore_directive_only_when_allowed() {
         let token = ["ghp_", "1234567890", "abcdefghijklmnoPQRST"].concat();
         let content = format!("const FIXTURE: &str = \"{token}\"; // vektor:ignore");
-        assert!(scan_text("test.rs", &content).is_empty());
+        let ignored = scan_text("test.rs", &content);
+        assert!(ignored.is_empty(), "expected empty, got: {ignored:?}");
         assert_eq!(
             scan_text_with_options("run_command", &content, false).len(),
             1
@@ -455,7 +456,7 @@ mod tests {
         std::fs::write(dir.join("fixtures").join("sample.txt"), &token).expect("write fixture");
 
         let findings = scan_path(&dir).expect("scan");
-        assert!(findings.is_empty());
+        assert!(findings.is_empty(), "expected empty, got: {findings:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

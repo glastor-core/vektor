@@ -7,7 +7,7 @@ use anyhow::Result;
 use clap::ValueEnum;
 use serde_json::json;
 use vektor_analyzers::config::VektorConfig;
-use vektor_analyzers::{cargo, gha, hygiene, rust_ast, sarif, secrets, trojan, Severity};
+use vektor_analyzers::{cargo, gha, hygiene, pii, rust_ast, sarif, secrets, trojan, Severity};
 use vektor_core::hooks::HookEvent;
 
 use crate::{hook_runner, mcp_server};
@@ -143,6 +143,66 @@ pub(crate) fn run_audit(
         if failing_count > 0 {
             eprintln!(
                 "vektor audit failed: {failing_count} finding(s) met or exceeded severity threshold {threshold:?}"
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+pub(crate) fn run_pii(
+    path: Option<PathBuf>,
+    format: OutputFormat,
+    fail_on: Option<FailSeverity>,
+) -> Result<ExitCode> {
+    let root = resolve_root(path)?;
+    let hits = pii::scan_path(&root)?;
+
+    match format {
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "workspaceRoot": root.display().to_string(),
+                "findingCount": hits.len(),
+                "findings": hits
+            }))?
+        ),
+        OutputFormat::Markdown => {
+            let mut out = format!(
+                "## Vektor PII Guard (`glastor-core/pii-veil` inspired)\n\n- **Findings**: {}\n",
+                hits.len()
+            );
+            if !hits.is_empty() {
+                out.push_str(
+                    "\n| Severity | Rule | Location | Message |\n| :--- | :--- | :--- | :--- |\n",
+                );
+                for h in &hits {
+                    let _ = writeln!(
+                        out,
+                        "| `{:?}` | `{}` | `{}:{}` | {} |",
+                        h.severity, h.rule_id, h.file, h.line, h.message
+                    );
+                }
+            }
+            print!("{out}");
+        }
+        OutputFormat::Pretty => {
+            println!("Vektor PII Guard: {} finding(s)", hits.len());
+            for h in &hits {
+                println!(
+                    "  [{:?}] {} {}:{} — {} ({})",
+                    h.severity, h.rule_id, h.file, h.line, h.message, h.redacted_match
+                );
+            }
+        }
+    }
+
+    if let Some(threshold) = fail_on.map(Severity::from) {
+        let failing = hits.iter().filter(|f| f.severity >= threshold).count();
+        if failing > 0 {
+            eprintln!(
+                "vektor pii failed: {failing} finding(s) met or exceeded severity threshold {threshold:?}"
             );
             return Ok(ExitCode::FAILURE);
         }

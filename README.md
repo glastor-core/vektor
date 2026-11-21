@@ -56,6 +56,9 @@ flowchart LR
 ### 1. Install the binary
 
 ```bash
+# Via Homebrew (macOS & Linux — official GLASTOR tap)
+brew install glastor-core/tap/vektor
+
 # Via cargo-binstall (downloads prebuilt release binary with SLSA provenance)
 cargo binstall vektor-cli
 
@@ -126,6 +129,7 @@ stop_gate = "selective" # "selective" | "full" | "off"
 | `vektor_team_roster` | 7-expert specialist delegation matrix | `readOnly`, `idempotent` |
 | `vektor_cargo_audit_deps` | Duplicate crates, MSRV conflicts, licenses/copyleft | `readOnly`, `idempotent` |
 | `vektor_scan_secrets` | 16 provider rules + Shannon entropy scanner | `readOnly`, `idempotent` |
+| `vektor_scan_pii` | Sub-ms PII Guard (Luhn cards, SSN, IBAN, emails) | `readOnly`, `idempotent` |
 | `vektor_lint_gha` | GitHub Actions SHA pinning, permissions, injection, timeouts | `readOnly`, `idempotent` |
 | `vektor_rust_ast_query` | Incremental `tree-sitter-rust` symbol & `unsafe` index | `readOnly`, `idempotent` |
 | `vektor_rust_api_diff` | AST SemVer public API breaking-change diff vs Git | `readOnly`, `idempotent` |
@@ -148,6 +152,18 @@ Measured via `vektor bench --iterations 200` (even in an unoptimized debug build
 | `PreToolUse` hook (JSON → secret/Trojan scan → JSON) | `109.3 µs` | **`25.9 µs`** | **`44.1 µs`** |
 | GitHub Actions lint (hardened workflow) | `66.3 µs` | **`52.6 µs`** | **`54.6 µs`** |
 | Secrets + Trojan Guard scan (100-line Rust file) | `1.76 ms` | **`1.75 ms`** | **`1.81 ms`** |
+
+---
+
+## GLASTOR® Core Ecosystem
+
+Vektor integrates directly with sibling tools from **[glastor-core](https://github.com/glastor-core)**:
+
+- **[homebrew-tap](https://github.com/glastor-core/homebrew-tap)**: Official `brew install glastor-core/tap/vektor` distribution.
+- **[byte-gauge](https://github.com/glastor-core/byte-gauge)**: Audits the compiled Linux release binary in `release.yml` (`checksec` PIE/NX, entropy, size guard).
+- **[specter](https://github.com/glastor-core/specter)**: Runs polyglot AST API contract & Trojan Guard checks in `ci.yml`.
+- **[pii-veil](https://github.com/glastor-core/pii-veil)**: Inspires `vektor pii` / `vektor_scan_pii` sub-millisecond PII detection.
+- **[zerho](https://github.com/glastor-core/zerho)**: Inspires [llms.txt](llms.txt) for instant AI-agent onboarding.
 
 ---
 

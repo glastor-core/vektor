@@ -605,16 +605,23 @@ mod tests {
             .prune_missing_ast_files(&BTreeSet::new())
             .expect("prune");
         assert_eq!(pruned, 1);
-        assert!(store
+        let after_prune = store
             .query_symbols(Some("State"), Some("struct"), None, 10)
-            .expect("query after prune")
-            .is_empty());
+            .expect("query after prune");
+        assert!(
+            after_prune.is_empty(),
+            "expected empty, got: {after_prune:?}"
+        );
 
         // Dirty files
         store.mark_dirty_file("src/lib.rs").expect("mark dirty");
         assert_eq!(store.list_dirty_files().expect("list dirty").len(), 1);
         store.clear_dirty_files().expect("clear");
-        assert!(store.list_dirty_files().expect("empty").is_empty());
+        let empty_dirty = store.list_dirty_files().expect("empty");
+        assert!(
+            empty_dirty.is_empty(),
+            "expected empty, got: {empty_dirty:?}"
+        );
     }
 
     #[test]
@@ -646,10 +653,13 @@ mod tests {
             .expect("index 2");
 
         // Exact kind filter must NOT accept `%` wildcard.
-        assert!(store
+        let wildcard_hits = store
             .query_symbols(None, Some("%"), None, 10)
-            .expect("query")
-            .is_empty());
+            .expect("query");
+        assert!(
+            wildcard_hits.is_empty(),
+            "expected no wildcard hits, got: {wildcard_hits:?}"
+        );
 
         // `_` in file filter must match literal underscore, not `X`.
         let matched = store

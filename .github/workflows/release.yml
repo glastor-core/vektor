@@ -102,6 +102,14 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} --bin vektor
 
+      - name: Audit Linux release binary (GLASTOR Byte-Gauge)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        uses: glastor-core/byte-gauge@c8d4198e424635933a6cd0e1a21d5058e26546e3 # main
+        with:
+          file-path: target/x86_64-unknown-linux-gnu/release/vektor
+          max-size-mb: "25"
+          post-pr-comment: "false"
+
       - name: Package Unix archive
         if: matrix.archive == 'tar.gz'
         shell: bash

@@ -66,7 +66,7 @@ fn e2e_mcp_stdio_initialize_list_and_health() {
 
     let list: Value = serde_json::from_str(lines[1]).expect("parse list");
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 13);
+    assert_eq!(tools.len(), 14);
 
     let health: Value = serde_json::from_str(lines[2]).expect("parse health");
     assert_eq!(health["result"]["isError"], false);

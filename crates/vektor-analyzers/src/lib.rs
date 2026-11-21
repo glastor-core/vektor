@@ -6,6 +6,7 @@ pub mod cargo;
 pub mod config;
 pub mod gha;
 pub mod hygiene;
+pub mod pii;
 pub mod rust_ast;
 pub mod sarif;
 pub mod secrets;

@@ -229,9 +229,10 @@ fn evaluate_stop(input: &StopInput) -> StopOutput {
         return StopOutput::allow_stop();
     }
 
-    let gate_mode = env_gate
-        .as_deref()
-        .map_or_else(|| VektorConfig::load(&root).stop_gate, str::to_ascii_lowercase);
+    let gate_mode = env_gate.as_deref().map_or_else(
+        || VektorConfig::load(&root).stop_gate,
+        str::to_ascii_lowercase,
+    );
     if gate_mode == "off" || gate_mode == "0" {
         return StopOutput::allow_stop();
     }

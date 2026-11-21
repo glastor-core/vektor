@@ -1,0 +1,39 @@
+# Vektor (`glastor-core/vektor`)
+
+> High-speed 100% safe-Rust (`unsafe_code = "forbid"`) MCP server, sub-millisecond Antigravity lifecycle hook engine, DevSecOps CLI auditor, and 7-expert development team plugin integrated with Engram persistent memory.
+
+## Quick Links
+- Repository: https://github.com/glastor-core/vektor
+- Releases: https://github.com/glastor-core/vektor/releases
+- Homebrew Tap: `brew install glastor-core/tap/vektor`
+- Cargo Binstall: `cargo binstall vektor-cli`
+
+## Workspace Architecture
+- `crates/vektor-core`: Strict JSON-RPC 2.0 MCP stdio engine (protocol negotiation `2024-11-05` / `2025-03-26` / `2025-06-18`, `ToolAnnotations`, MCP Resources) and Antigravity hook contracts.
+- `crates/vektor-analyzers`: Pure-Rust deterministic analyzers: `secrets` (16 provider rules + Shannon entropy + `--staged`), `pii` (Luhn credit cards, SSN, IBAN, emails — inspired by `glastor-core/pii-veil`), `trojan` (Unicode BiDi CVE-2021-42574), `gha` (GitHub Actions hardening + `--fix`), `rust_ast` (`tree-sitter-rust` + SemVer API diff), `cargo` (duplicates/MSRV/licenses + CycloneDX 1.5 SBOM), `sarif` (2.1.0), `hygiene` (0-100 score), and `config` (`vektor.toml` + `.gitignore`).
+- `crates/vektor-state`: SQLite WAL (`.vektor/state.db`) for Swarm Task Blackboard, advisory file locks with TTL, incremental AST cache, and dirty-file tracking.
+- `crates/vektor-cli`: Single `vektor` binary (`mcp`, `hook`, `audit`, `pii`, `sbom`, `api-diff`, `deps`, `hygiene`, `doctor`, `init`, `bench`, `status`).
+- `plugin/`: Native Antigravity plugin bundling 7 specialist subagents (`rust-expert`, `crates-specialist`, `security-auditor`, `gh-actions-engineer`, `github-maintainer`, `astro-expert`, `markdown-docs-expert`).
+
+## CLI Commands
+- `vektor init [--install-plugin]` — Generate starter `vektor.toml` and install Antigravity plugin.
+- `vektor doctor [--format pretty|json]` — Diagnose binary, toolchain, `vektor.toml`, plugin, and hygiene.
+- `vektor audit [--format pretty|markdown|json|sarif] [--fail-on low|medium|high|critical] [--staged] [--fix]`
+- `vektor pii [--format pretty|markdown|json] [--fail-on low|medium|high|critical]`
+- `vektor sbom [--offline]` — Export CycloneDX 1.5 JSON SBOM.
+- `vektor api-diff [--base HEAD] [--format pretty|markdown|json] [--fail-on-breaking]`
+- `vektor deps [--offline] [--format pretty|markdown|json]`
+- `vektor hygiene [--min-score 90] [--format pretty|markdown|json]`
+- `vektor bench [--iterations 200]` — Reproducible micro-benchmarks (`PreToolUse` ~26 us p50).
+
+## MCP Tools (14) & Resources (2)
+- Read-only (`readOnlyHint: true`): `vektor_health`, `vektor_workspace_info`, `vektor_team_roster`, `vektor_cargo_audit_deps`, `vektor_scan_secrets`, `vektor_scan_pii`, `vektor_lint_gha`, `vektor_rust_ast_query`, `vektor_rust_api_diff`, `vektor_sbom_cyclonedx`, `vektor_security_sarif`, `vektor_repo_hygiene`.
+- Local mutation: `vektor_swarm_task`, `vektor_swarm_lock`.
+- Resources: `vektor://workspace/summary`, `vektor://swarm/tasks`.
+
+## GLASTOR Core Ecosystem Integrations
+- `glastor-core/homebrew-tap`: Official Homebrew formula (`Formula/vektor.rb`).
+- `glastor-core/byte-gauge`: Binary `checksec` & entropy auditor in `release.yml`.
+- `glastor-core/specter`: Polyglot AST SemVer API contract gate in `ci.yml`.
+- `glastor-core/pii-veil`: Inspiration for `vektor_analyzers::pii`.
+- `glastor-core/zerho`: Inspiration for `llms.txt` agent-native documentation.
