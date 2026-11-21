@@ -197,10 +197,12 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           gh release create "$TAG" release-assets/* \
+            --repo "$REPO" \
             --title "Vektor ${TAG}" \
             --generate-notes
 

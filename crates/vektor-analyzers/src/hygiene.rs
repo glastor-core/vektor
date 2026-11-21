@@ -129,9 +129,7 @@ pub fn audit_repo_hygiene(root: &Path) -> Result<RepoHygieneReport> {
 fn check_github_actions_hygiene(root: &Path) -> Result<HygieneCheck> {
     let gha_findings = gha::lint_workspace_or_file(root)?;
     let workflows_dir = root.join(".github").join("workflows");
-    let has_workflows = std::fs::read_dir(&workflows_dir)
-        .ok()
-        .is_some_and(|mut it| it.next().is_some());
+    let has_workflows = std::fs::read_dir(&workflows_dir).is_ok_and(|mut it| it.next().is_some());
     let severe_gha = gha_findings
         .iter()
         .filter(|f| f.severity >= Severity::High)
