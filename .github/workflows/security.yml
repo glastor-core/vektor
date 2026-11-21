@@ -1,0 +1,89 @@
+name: Security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  cargo-deny:
+    name: Supply-Chain Audit (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
+        with:
+          command: check advisories bans licenses sources
+
+  vektor-audit:
+    name: Vektor DevSecOps Audit (SARIF + Hygiene)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: security-vektor-audit
+
+      - name: Build Vektor CLI
+        run: cargo build --locked --bin vektor
+
+      - name: Run Vektor DevSecOps SARIF audit
+        id: sarif_audit
+        run: |
+          set -euo pipefail
+          ./target/debug/vektor audit --format sarif --fail-on high > vektor.sarif
+
+      - name: Run strict Vektor JSON audit (zero findings gate)
+        run: ./target/debug/vektor audit --format json --fail-on low
+
+      - name: Upload SARIF artifact
+        if: always() && hashFiles('vektor.sarif') != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: vektor-sarif
+          path: vektor.sarif
+          retention-days: 14
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: >-
+          always() &&
+          hashFiles('vektor.sarif') != '' &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@d2aacf54c2fbc910db8d7ec338fdb54ea48c692d # v3
+        with:
+          sarif_file: vektor.sarif
+          category: vektor-devsecops
