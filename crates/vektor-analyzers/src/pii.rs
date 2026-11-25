@@ -84,7 +84,7 @@ pub fn is_valid_luhn(candidate: &str) -> bool {
 
 fn is_example_email(email: &str) -> bool {
     let lower = email.to_ascii_lowercase();
-    lower.ends_with("@example.com")
+    if lower.ends_with("@example.com")
         || lower.ends_with("@example.org")
         || lower.ends_with("@example.net")
         || lower.ends_with("@localhost")
@@ -93,6 +93,36 @@ fn is_example_email(email: &str) -> bool {
             .is_some_and(|(_, tld)| tld == "local")
         || lower.contains("noreply@")
         || lower.contains("no-reply@")
+    {
+        return true;
+    }
+
+    // Ignore public organizational/governance role mailboxes (non-personal contact addresses).
+    if let Some((local, _)) = lower.split_once('@') {
+        if matches!(
+            local,
+            "founder"
+                | "security"
+                | "conduct"
+                | "support"
+                | "info"
+                | "contact"
+                | "legal"
+                | "privacy"
+                | "press"
+                | "hello"
+                | "maintainers"
+                | "opensource"
+                | "oss"
+                | "abuse"
+                | "team"
+                | "admin"
+        ) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn redact_pii(raw: &str) -> String {
@@ -287,13 +317,17 @@ mod tests {
         let card = ["4111", "1111", "1111", "1111"].join("-");
         let ssn = ["123", "45", "6789"].join("-");
         let content = format!(
-            "card = \"{card}\"\nssn = \"{ssn}\"\ncontact = \"user@example.com\"\nreal = \"alice@acme.io\"\n" // vektor:ignore
+            "card = \"{card}\"\nssn = \"{ssn}\"\ncontact = \"user@example.com\"\norg = \"founder@glastor.es\"\nsec = \"security@acme.io\"\nreal = \"alice@acme.io\"\n" // vektor:ignore
         );
         let hits = scan_text("sample.txt", &content);
         let ids: Vec<&str> = hits.iter().map(|h| h.rule_id.as_str()).collect();
         assert!(ids.contains(&"PII-CREDIT-CARD"));
         assert!(ids.contains(&"PII-US-SSN"));
         assert!(ids.contains(&"PII-EMAIL"));
-        assert_eq!(hits.len(), 3, "example.com email must be ignored: {hits:?}");
+        assert_eq!(
+            hits.len(),
+            3,
+            "example.com and role-based governance emails must be ignored: {hits:?}"
+        );
     }
 }
