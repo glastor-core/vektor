@@ -401,10 +401,10 @@ pub fn sha256_hex(data: &[u8]) -> String {
     }
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    for chunk in padded.as_chunks::<64>().0 {
         let mut schedule = [0u32; 64];
-        for (idx, word) in chunk.chunks_exact(4).enumerate() {
-            schedule[idx] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        for (idx, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            schedule[idx] = u32::from_be_bytes(*word);
         }
         for idx in 16..64 {
             let s0 = schedule[idx - 15].rotate_right(7)
@@ -543,7 +543,7 @@ mod tests {
         let synthetic_val = ["vektor_env_", "fixture_9942_alpha"].concat();
         let env_content = format!("APP_RUNTIME_SALT={synthetic_val}\n");
         let fps = extract_taint_fingerprints(".env", &env_content);
-        assert!(!fps.is_empty());
+        assert!(!fps.is_empty(), "expected non-empty fingerprints");
         assert!(fps.iter().all(|f| !f.token_hash.contains(&synthetic_val)));
 
         let active: Vec<ActiveTaint> = fps

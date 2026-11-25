@@ -309,14 +309,12 @@ mod tests {
             store.active_session_taints("sess-a").expect("list a").len(),
             1
         );
-        assert!(store
-            .active_session_taints("sess-b")
-            .expect("list b")
-            .is_empty());
+        let b_taints = store.active_session_taints("sess-b").expect("list b");
+        assert!(b_taints.is_empty(), "expected empty, got: {b_taints:?}");
         assert_eq!(store.clear_session_taints("sess-a").expect("clear"), 1);
-        assert!(store
+        let a_after = store
             .active_session_taints("sess-a")
-            .expect("list after clear")
-            .is_empty());
+            .expect("list after clear");
+        assert!(a_after.is_empty(), "expected empty, got: {a_after:?}");
     }
 }
