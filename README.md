@@ -66,11 +66,18 @@ cargo binstall vektor-cli
 cargo install --path crates/vektor-cli
 ```
 
-### 2. Initialize workspace & plugin
+### 2. Initialize workspace & agent hooks
 
 ```bash
 # Generate starter vektor.toml and install the Antigravity plugin
 vektor init --install-plugin
+
+# Or scaffold hooks/MCP for Claude Code, Cursor, Codex, or Git pre-commit
+vektor init --target claude-code
+vektor init --target cursor
+vektor init --target codex
+vektor init --target git-hooks
+vektor init --target all
 
 # Verify binary, toolchain, config, plugin, and repo hygiene
 vektor doctor

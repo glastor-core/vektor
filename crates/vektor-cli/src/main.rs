@@ -1,4 +1,5 @@
 mod cli_commands;
+mod hook_adapters;
 mod hook_runner;
 mod hook_shell;
 mod mcp_resources;
@@ -13,6 +14,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use vektor_core::hooks::HookEvent;
 
 use crate::cli_commands::{AuditFormat, FailSeverity, OutputFormat};
+use crate::hook_adapters::{HookAdapter, InitTarget};
 
 #[derive(Parser)]
 #[command(
@@ -29,11 +31,14 @@ struct Cli {
 enum Commands {
     /// Run the Vektor MCP server over stdio.
     Mcp,
-    /// Execute a synchronous Antigravity lifecycle hook reading JSON from stdin.
+    /// Execute a synchronous agent lifecycle hook reading JSON from stdin.
     Hook {
         /// Lifecycle event name.
         #[arg(value_enum)]
         event: HookEventArg,
+        /// Agent wire protocol adapter (`auto`, `antigravity`, `claude-code`, `cursor`, `codex`).
+        #[arg(long, value_enum, default_value_t = HookAdapter::Auto)]
+        adapter: HookAdapter,
     },
     /// Print diagnostic status for the current workspace.
     Status,
@@ -145,17 +150,20 @@ enum Commands {
         #[arg(long, value_enum, default_value_t = OutputFormat::Pretty)]
         format: OutputFormat,
     },
-    /// Initialize `vektor.toml` and optionally install the Antigravity plugin.
+    /// Initialize `vektor.toml` and optionally configure agent hooks/MCP (`antigravity`, `claude-code`, `cursor`, `codex`, `git-hooks`, `all`).
     Init {
         /// Target workspace directory.
         #[arg(long)]
         path: Option<PathBuf>,
-        /// Overwrite existing `vektor.toml`.
+        /// Overwrite existing config files.
         #[arg(long)]
         force: bool,
         /// Copy `plugin/` into `~/.gemini/config/plugins/vektor`.
         #[arg(long)]
         install_plugin: bool,
+        /// Generate native hook/MCP config for one or more target agents.
+        #[arg(long, value_enum)]
+        target: Vec<InitTarget>,
     },
     /// Run reproducible micro-benchmarks for hooks and static analyzers.
     Bench {
@@ -197,10 +205,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             server.run_stdio(stdin.lock(), stdout.lock())?;
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Hook { event } => {
+        Commands::Hook { event, adapter } => {
             let stdin = io::stdin();
             let stdout = io::stdout();
-            hook_runner::run(event.into(), stdin.lock(), stdout.lock())?;
+            hook_runner::run_with_adapter(event.into(), adapter, stdin.lock(), stdout.lock())?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Status => {
@@ -251,7 +259,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
             path,
             force,
             install_plugin,
-        } => cli_commands::run_init(path, force, install_plugin),
+            target,
+        } => cli_commands::run_init(path, force, install_plugin, &target),
         Commands::Bench { iterations } => cli_commands::run_bench(iterations),
     }
 }

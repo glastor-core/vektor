@@ -560,3 +560,85 @@ fn e2e_cli_sbom_deps_hygiene_pii_and_bench_smoke() {
     assert!(bench.status.success(), "bench failed");
     assert!(String::from_utf8_lossy(&bench.stdout).contains("PreToolUse hook"));
 }
+
+#[test]
+fn e2e_multi_agent_init_and_claude_cursor_hook_adapters() {
+    let dir = std::env::temp_dir().join(format!("vektor-e2e-multi-agent-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+
+    // 1. `vektor init --target claude-code --target cursor --target codex` scaffolds all configs.
+    let init = Command::new(vektor_bin())
+        .args(["init", "--path"])
+        .arg(&dir)
+        .args([
+            "--target",
+            "claude-code",
+            "--target",
+            "cursor",
+            "--target",
+            "codex",
+        ])
+        .output()
+        .expect("run init targets");
+    assert!(init.status.success(), "init targets failed");
+    assert!(dir.join("vektor.toml").is_file());
+    assert!(dir.join(".claude").join("settings.json").is_file());
+    assert!(dir.join(".cursor").join("hooks.json").is_file());
+    assert!(dir.join(".cursor").join("mcp.json").is_file());
+    assert!(dir.join(".codex").join("config.toml").is_file());
+
+    // 2. Claude Code adapter auto-detects `tool_name` + `tool_input` and returns `hookSpecificOutput`.
+    let claude_deny_payload = json!({
+        "session_id": "claude-s1",
+        "cwd": dir.display().to_string(),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": { "command": "git push --force origin main" }
+    });
+    let mut claude_child = Command::new(vektor_bin())
+        .args(["hook", "pre-tool-use", "--adapter", "claude-code"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn claude hook");
+    claude_child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(claude_deny_payload.to_string().as_bytes())
+        .expect("write");
+    let claude_out = claude_child.wait_with_output().expect("wait");
+    assert!(claude_out.status.success());
+    let claude_json: Value = serde_json::from_slice(&claude_out.stdout).expect("claude json");
+    assert_eq!(
+        claude_json["hookSpecificOutput"]["permissionDecision"],
+        "deny"
+    );
+
+    // 3. Cursor adapter handles `workspace_roots` + `command` and returns `permission`.
+    let cursor_allow_payload = json!({
+        "conversation_id": "cursor-c1",
+        "workspace_roots": [dir.display().to_string()],
+        "hook_event_name": "beforeShellExecution",
+        "command": "cargo test --workspace"
+    });
+    let mut cursor_child = Command::new(vektor_bin())
+        .args(["hook", "pre-tool-use", "--adapter", "cursor"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn cursor hook");
+    cursor_child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all(cursor_allow_payload.to_string().as_bytes())
+        .expect("write");
+    let cursor_out = cursor_child.wait_with_output().expect("wait");
+    assert!(cursor_out.status.success());
+    let cursor_json: Value = serde_json::from_slice(&cursor_out.stdout).expect("cursor json");
+    assert_eq!(cursor_json["permission"], "allow");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -6,6 +6,7 @@ use std::path::Path;
 
 /// Workspace-level Vektor configuration loaded from `vektor.toml` + ignore files.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct VektorConfig {
     /// Whether `.gitignore` patterns at workspace root are honored during scans.
     pub respect_gitignore: bool,
@@ -17,6 +18,12 @@ pub struct VektorConfig {
     pub entropy_threshold: f64,
     /// Stop hook gate mode (`selective`, `full`, or `off`).
     pub stop_gate: String,
+    /// Block or confirm reward-hacking edits (test/assert removal, lint/policy weakening).
+    pub anti_reward_hacking: bool,
+    /// Enable cross-tool session taint tracking (`PostToolUse` -> `PreToolUse`).
+    pub taint_tracking: bool,
+    /// Session taint fingerprint TTL in seconds (default: 1800).
+    pub taint_ttl_secs: i64,
     /// Whether a `vektor.toml` file was found and loaded.
     pub loaded_from_file: bool,
 }
@@ -29,6 +36,9 @@ impl Default for VektorConfig {
             disabled_rules: Vec::new(),
             entropy_threshold: 3.5,
             stop_gate: "selective".to_string(),
+            anti_reward_hacking: true,
+            taint_tracking: true,
+            taint_ttl_secs: 1800,
             loaded_from_file: false,
         }
     }
@@ -144,6 +154,23 @@ impl VektorConfig {
                     self.stop_gate = s;
                 }
             }
+            ("hooks", "anti_reward_hacking") => {
+                if let Some(b) = parse_bool(val) {
+                    self.anti_reward_hacking = b;
+                }
+            }
+            ("hooks", "taint_tracking") => {
+                if let Some(b) = parse_bool(val) {
+                    self.taint_tracking = b;
+                }
+            }
+            ("hooks", "taint_ttl_secs") => {
+                if let Ok(v) = val.parse::<i64>() {
+                    if (60..=86_400).contains(&v) {
+                        self.taint_ttl_secs = v;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -207,6 +234,11 @@ entropy_threshold = 3.5
 [hooks]
 # Stop quality gate mode: "selective" | "full" | "off"
 stop_gate = "selective"
+# Anti-Reward-Hacking AST & Policy Integrity Gate in PreToolUse
+anti_reward_hacking = true
+# Cross-tool Session Taint Tracking (PostToolUse -> PreToolUse)
+taint_tracking = true
+taint_ttl_secs = 1800
 "#
     }
 }

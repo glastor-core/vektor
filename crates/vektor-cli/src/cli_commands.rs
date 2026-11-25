@@ -12,6 +12,10 @@ use vektor_analyzers::{
 };
 use vektor_core::hooks::HookEvent;
 
+use crate::hook_adapters::{
+    write_claude_code_config, write_codex_config, write_cursor_config, write_git_pre_commit_hook,
+    InitTarget,
+};
 use crate::{hook_runner, mcp_server};
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -519,6 +523,7 @@ pub(crate) fn run_init(
     path: Option<PathBuf>,
     force: bool,
     install_plugin: bool,
+    targets: &[InitTarget],
 ) -> Result<ExitCode> {
     let root = resolve_root(path)?;
     let toml_path = root.join("vektor.toml");
@@ -533,7 +538,41 @@ pub(crate) fn run_init(
         println!("Created {}", toml_path.display());
     }
 
-    if install_plugin {
+    let mut do_antigravity_plugin = install_plugin;
+    for &target in targets {
+        match target {
+            InitTarget::Antigravity => {
+                do_antigravity_plugin = true;
+            }
+            InitTarget::ClaudeCode => {
+                println!("{}", write_claude_code_config(&root, force)?);
+            }
+            InitTarget::Cursor => {
+                for msg in write_cursor_config(&root, force)? {
+                    println!("{msg}");
+                }
+            }
+            InitTarget::Codex => {
+                println!("{}", write_codex_config(&root, force)?);
+            }
+            InitTarget::GitHooks => {
+                println!("{}", write_git_pre_commit_hook(&root, force)?);
+            }
+            InitTarget::All => {
+                println!("{}", write_claude_code_config(&root, force)?);
+                for msg in write_cursor_config(&root, force)? {
+                    println!("{msg}");
+                }
+                println!("{}", write_codex_config(&root, force)?);
+                println!("{}", write_git_pre_commit_hook(&root, force)?);
+                if root.join("plugin").is_dir() {
+                    do_antigravity_plugin = true;
+                }
+            }
+        }
+    }
+
+    if do_antigravity_plugin {
         let src = root.join("plugin");
         if !src.is_dir() {
             anyhow::bail!("No `plugin/` directory found at {}", src.display());

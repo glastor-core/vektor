@@ -43,4 +43,16 @@ CREATE TABLE IF NOT EXISTS dirty_files (
     file_path TEXT PRIMARY KEY,
     touched_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS session_taints (
+    session_id TEXT NOT NULL,
+    token_hash TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    encoding TEXT NOT NULL DEFAULT 'raw',
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, token_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_taints_session_exp ON session_taints(session_id, expires_at);
 ";

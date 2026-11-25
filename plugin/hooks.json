@@ -16,7 +16,7 @@
   "vektor-post-tool": {
     "PostToolUse": [
       {
-        "matcher": "edit_file|write_file",
+        "matcher": "read_file|view_file|run_command|edit_file|write_file",
         "hooks": [
           {
             "type": "command",

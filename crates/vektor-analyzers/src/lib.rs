@@ -7,9 +7,11 @@ pub mod config;
 pub mod gha;
 pub mod hygiene;
 pub mod pii;
+pub mod reward_guard;
 pub mod rust_ast;
 pub mod sarif;
 pub mod secrets;
+pub mod taint;
 pub mod trojan;
 pub mod web_ast;
 

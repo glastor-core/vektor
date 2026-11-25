@@ -136,3 +136,88 @@ fn is_root_target(arg: &str) -> bool {
         && bytes[1] == b':'
         && matches!(&norm[2..], "" | "/" | "/*")
 }
+
+/// Detect outbound network or remote-transfer commands that could exfiltrate tainted session data.
+pub(crate) fn detect_network_exfil_command(
+    tokens: &[String],
+    raw_segment: &str,
+) -> Option<&'static str> {
+    let first = tokens.first()?;
+    let bin = Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first);
+    let bin_no_ext = bin.strip_suffix(".exe").unwrap_or(bin);
+
+    match bin_no_ext {
+        "curl" => Some("curl"),
+        "wget" => Some("wget"),
+        "nc" | "ncat" | "netcat" => Some("netcat"),
+        "socat" => Some("socat"),
+        "scp" => Some("scp"),
+        "sftp" => Some("sftp"),
+        "rsync" => Some("rsync"),
+        "ssh" => Some("ssh"),
+        "ftp" | "tftp" | "telnet" => Some("ftp/telnet"),
+        "invoke-webrequest" | "iwr" => Some("Invoke-WebRequest"),
+        "invoke-restmethod" | "irm" => Some("Invoke-RestMethod"),
+        "start-bitstransfer" => Some("Start-BitsTransfer"),
+        "send-mailmessage" => Some("Send-MailMessage"),
+        "python" | "python3" | "py" => {
+            let lower = raw_segment.to_ascii_lowercase();
+            if lower.contains("urllib")
+                || lower.contains("requests.")
+                || lower.contains("http.client")
+                || lower.contains("httpx")
+                || lower.contains("socket.")
+            {
+                Some("python-network")
+            } else {
+                None
+            }
+        }
+        "node" | "deno" | "bun" => {
+            let lower = raw_segment.to_ascii_lowercase();
+            if lower.contains("fetch(")
+                || lower.contains("http.request")
+                || lower.contains("https.request")
+                || lower.contains("net.connect")
+            {
+                Some("js-runtime-network")
+            } else {
+                None
+            }
+        }
+        "powershell" | "pwsh" => {
+            let lower = raw_segment.to_ascii_lowercase();
+            if lower.contains("webclient")
+                || lower.contains("httpclient")
+                || lower.contains("invoke-webrequest")
+                || lower.contains("invoke-restmethod")
+            {
+                Some("powershell-network")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract candidate file paths referenced in a shell command that match sensitive filenames.
+pub(crate) fn extract_sensitive_paths_from_command(cmd: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for segment in split_shell_segments(cmd) {
+        for raw_tok in segment.split_whitespace() {
+            let clean = raw_tok.trim_matches(['"', '\'', '`', ',', ';', '(', ')']);
+            if clean.is_empty() || clean.starts_with('-') {
+                continue;
+            }
+            if vektor_analyzers::taint::is_sensitive_path(clean) && !out.iter().any(|p| p == clean)
+            {
+                out.push(clean.to_string());
+            }
+        }
+    }
+    out
+}

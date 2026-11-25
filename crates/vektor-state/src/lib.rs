@@ -6,6 +6,7 @@
 mod ast_cache;
 mod locks;
 mod schema;
+mod taint;
 mod tasks;
 
 use std::fmt;
@@ -16,6 +17,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 
 pub use locks::FileLock;
+pub use taint::{SessionTaint, DEFAULT_TAINT_TTL_SECS};
 pub use tasks::SwarmTask;
 
 /// Handle to `<workspace>/.vektor/state.db` in `SQLite` WAL mode.
@@ -286,5 +288,35 @@ mod tests {
         assert!(losers.iter().all(|h| h == &winners[0]));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_taints_isolate_sessions_and_clear_cleanly() {
+        let mut store = StateStore::open_in_memory().expect("in-memory");
+        let fps = vec![vektor_analyzers::taint::TaintFingerprint {
+            token_hash: "deadbeef0123456789".to_string(),
+            kind: "env_value".to_string(),
+            encoding: "raw".to_string(),
+        }];
+
+        assert_eq!(
+            store
+                .record_session_taints("sess-a", ".env", &fps, Some(60))
+                .expect("record"),
+            1
+        );
+        assert_eq!(
+            store.active_session_taints("sess-a").expect("list a").len(),
+            1
+        );
+        assert!(store
+            .active_session_taints("sess-b")
+            .expect("list b")
+            .is_empty());
+        assert_eq!(store.clear_session_taints("sess-a").expect("clear"), 1);
+        assert!(store
+            .active_session_taints("sess-a")
+            .expect("list after clear")
+            .is_empty());
     }
 }

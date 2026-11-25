@@ -18,3 +18,8 @@ entropy_threshold = 3.5
 [hooks]
 # Stop quality gate mode: "selective" | "full" | "off"
 stop_gate = "selective"
+# Anti-Reward-Hacking AST & Policy Integrity Gate in PreToolUse
+anti_reward_hacking = true
+# Cross-tool Session Taint Tracking (PostToolUse -> PreToolUse)
+taint_tracking = true
+taint_ttl_secs = 1800
