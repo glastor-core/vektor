@@ -20,11 +20,11 @@ readme = "README.md"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 regex = "1.11"
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tree-sitter = "0.24"
-tree-sitter-rust = "0.23"
+tree-sitter = "0.27"
+tree-sitter-rust = "0.24"
 tree-sitter-typescript = "0.23"
 vektor-analyzers = { version = "0.1.0", path = "crates/vektor-analyzers" }
 vektor-core = { version = "0.1.0", path = "crates/vektor-core" }
